@@ -21,7 +21,6 @@ import dataclasses
 import json
 import os
 import weakref
-from collections import deque
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, get_args
 
@@ -37,7 +36,6 @@ from livekit.agents import (
 )
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import AudioBuffer, is_given
-from livekit.rtc import AudioFrame
 
 from .api import ws_headers
 from .log import log_server_message, logger
@@ -82,8 +80,10 @@ class STTOptions:
     language: LanguageCode = LanguageCode("en")
     vad_threshold: float = 0.6
     vad_bucket: int | None = 2
-    # When set, we flush the stt state on the first time the VAD triggers
-    # in order to recover the text currently being processed as soon as possible.
+    # When set, a `flush` request is sent the first time the VAD triggers and the turn
+    # ends on the server's `flushed` reply, which recovers the text held by the model
+    # delay without waiting for the delay to elapse. When unset, the turn ends once the
+    # VAD has stayed triggered for the model delay.
     vad_flush: bool = True
     # When set, a VAD inactivity probability below this threshold signals the start of
     # speech before any text is transcribed, which allows a faster barge-in.
@@ -256,62 +256,12 @@ class STT(stt.STT):
             )
 
 
-class _PaddedTimeline:
-    """Maps provider timestamps back to caller audio time by removing synthetic padding.
-
-    Provider timestamps arrive in order, so padding that ends before a timestamp is
-    settled into a running total and later lookups only scan the padding still ahead.
-    """
-
-    def __init__(self, sample_rate: int) -> None:
-        self._sample_rate = sample_rate
-        self._sent_samples = 0
-        self._settled_padding = 0.0
-        # (provider start, duration) of padding a later timestamp may still precede
-        self._pending_padding: deque[tuple[float, float]] = deque()
-
-    def reset(self) -> None:
-        """Restart at provider time zero, for a new connection."""
-        self._sent_samples = 0
-        self._settled_padding = 0.0
-        self._pending_padding.clear()
-
-    def add_audio(self, samples: int) -> None:
-        """Advance the provider clock by ``samples`` of caller audio."""
-        self._sent_samples += samples
-
-    def add_padding(self, samples: int) -> None:
-        """Advance the provider clock by ``samples`` of synthetic silence.
-
-        The padding is recorded so that ``remove_padding`` can subtract it.
-        """
-        start = self._sent_samples / self._sample_rate
-        self._pending_padding.append((start, samples / self._sample_rate))
-        self._sent_samples += samples
-
-    def remove_padding(self, provider_time: float) -> float:
-        """Return the caller audio sent before ``provider_time``, in seconds."""
-        while self._pending_padding:
-            start, duration = self._pending_padding[0]
-            if start + duration > provider_time:
-                break
-            self._settled_padding += duration
-            self._pending_padding.popleft()
-
-        # a late boundary can precede padding that has already been sent
-        pending = sum(
-            min(max(provider_time - start, 0.0), duration)
-            for start, duration in self._pending_padding
-        )
-        return provider_time - self._settled_padding - pending
-
-
 class SpeechStream(stt.SpeechStream):
     @dataclass
     class _VADFlush(stt.SpeechStream._FlushSentinel):
-        """Request synthetic silence without advancing the caller's audio clock."""
+        """Ask the server to process the audio it holds and answer with `flushed`."""
 
-        samples_per_channel: int
+        flush_id: int
 
     def __init__(
         self,
@@ -334,6 +284,8 @@ class SpeechStream(stt.SpeechStream):
         self._speech_duration: float = 0
 
         self._reconnect_event = asyncio.Event()
+        # counts the flush requests of the stream, so an id is never reused after a reconnect
+        self._flush_count = 0
         self._ready_msg: dict[str, Any] | None = None
 
     @property
@@ -342,12 +294,6 @@ class SpeechStream(stt.SpeechStream):
         if self._ready_msg is not None:
             return int(self._ready_msg.get("delay_in_frames", DEFAULT_DELAY_IN_FRAMES))
         return DEFAULT_DELAY_IN_FRAMES
-
-    @property
-    def frame_size(self) -> int:
-        if self._ready_msg is not None:
-            return int(self._ready_msg.get("frame_size", 1920))
-        return 1920
 
     def update_options(
         self,
@@ -366,11 +312,11 @@ class SpeechStream(stt.SpeechStream):
         """
 
         closing_ws = False
-        flush_count = 0
-        timeline = _PaddedTimeline(self._opts.sample_rate)
+        # ids of the flushes the caller asked for, whose reply must always yield a final
+        manual_flushes: set[int] = set()
 
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            nonlocal closing_ws, flush_count
+            nonlocal closing_ws
             samples_per_buffer = 1920
 
             audio_bstream = utils.audio.AudioByteStream(
@@ -382,19 +328,19 @@ class SpeechStream(stt.SpeechStream):
             async for data in self._input_ch:
                 flush_id: int | None = None
                 if isinstance(data, self._VADFlush):
-                    zeros = AudioFrame.create(
-                        sample_rate=self._opts.sample_rate,
-                        num_channels=1,
-                        samples_per_channel=data.samples_per_channel,
-                    )
-                    timeline.add_padding(zeros.samples_per_channel)
-                    frames = audio_bstream.write(zeros.data.tobytes())
+                    flush_msg = {"type": "flush", "flush_id": data.flush_id}
+                    try:
+                        await ws.send_str(json.dumps(flush_msg))
+                    except (aiohttp.ClientError, ConnectionError):
+                        # the server closed first; recv_task raises the retryable error
+                        return
+                    continue
                 elif isinstance(data, self._FlushSentinel):
                     frames = audio_bstream.flush()
-                    flush_count += 1
-                    flush_id = flush_count
+                    self._flush_count += 1
+                    flush_id = self._flush_count
+                    manual_flushes.add(flush_id)
                 else:
-                    timeline.add_audio(data.samples_per_channel)
                     frames = audio_bstream.write(data.data.tobytes())
 
                 for frame in frames:
@@ -435,6 +381,8 @@ class SpeechStream(stt.SpeechStream):
             speech_end = 0.0
             speaking = False
             remaining_vad_steps: int | None = None
+            # id of the flush whose `flushed` reply ends the current turn
+            pending_flush: int | None = None
             monitor = utils.aio.WebSocketMonitor(
                 ws, liveness_timeout=self._conn_options.liveness_timeout
             )
@@ -442,15 +390,17 @@ class SpeechStream(stt.SpeechStream):
             def _end_time() -> float:
                 # the `end_text` timing when the server already sent it, else unknown
                 if speech_end > 0:
-                    return timeline.remove_padding(speech_end) + self.start_time_offset
+                    return speech_end + self.start_time_offset
                 return 0.0
 
             def _finalize() -> None:
-                nonlocal speaking, remaining_vad_steps, buffered_text, speech_end, preflight_text
+                nonlocal speaking, remaining_vad_steps, pending_flush
+                nonlocal buffered_text, speech_end, preflight_text
                 if not speaking:
                     return
                 speaking = False
                 remaining_vad_steps = None
+                pending_flush = None
                 preflight_text = ""
                 event = stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -488,6 +438,12 @@ class SpeechStream(stt.SpeechStream):
                         ],
                     )
                 )
+
+            def _preflight_at_trip() -> None:
+                if self._opts.preflight_trigger == "vad_trip":
+                    # the words so far are what the turn will most likely end with, so
+                    # trigger preemptive generation while the server recovers the rest
+                    _send_preflight()
 
             while True:
                 try:
@@ -563,8 +519,7 @@ class SpeechStream(stt.SpeechStream):
                                 stt.SpeechData(
                                     text=data["text"],
                                     language=self._opts.language,
-                                    start_time=timeline.remove_padding(data["start_s"])
-                                    + self.start_time_offset,
+                                    start_time=data["start_s"] + self.start_time_offset,
                                 )
                             ],
                         )
@@ -594,17 +549,19 @@ class SpeechStream(stt.SpeechStream):
                                 > self._opts.vad_threshold
                             )
                             if positive_vad:
-                                if remaining_vad_steps is None:
+                                if self._opts.vad_flush:
+                                    # the `flushed` reply ends the turn; once the input has
+                                    # ended, the server's end_of_stream does
+                                    if pending_flush is None and not self._input_ch.closed:
+                                        _preflight_at_trip()
+                                        self._flush_count += 1
+                                        pending_flush = self._flush_count
+                                        await self._input_ch.send(self._VADFlush(pending_flush))
+                                elif remaining_vad_steps is None:
+                                    # without a flush, the words held by the model delay
+                                    # arrive once that many steps have passed
                                     remaining_vad_steps = self.delay_in_frames
-                                    if self._opts.preflight_trigger == "vad_trip":
-                                        # the words so far are what the turn will most likely end
-                                        # with, so trigger preemptive generation while the model
-                                        # delay elapses and the flush recovers the pending text
-                                        _send_preflight()
-                                    if self._opts.vad_flush and not self._input_ch.closed:
-                                        await self._input_ch.send(
-                                            self._VADFlush(self.frame_size * self.delay_in_frames)
-                                        )
+                                    _preflight_at_trip()
                                 else:
                                     remaining_vad_steps -= 1
                                     if remaining_vad_steps <= 0:
@@ -619,19 +576,24 @@ class SpeechStream(stt.SpeechStream):
                             speech_end = data.get("stop_s", 0.0)
                     elif type_ == "flushed":
                         # the server returned every word the model delay held at the flush
-                        if speaking:
-                            _finalize()
-                        else:
-                            # nothing was heard, but the flush still needs an answer or the
-                            # commit waits for its transcript timeout
-                            self._event_ch.send_nowait(
-                                stt.SpeechEvent(
-                                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                    alternatives=[
-                                        stt.SpeechData(text="", language=self._opts.language)
-                                    ],
+                        flush_id = data.get("flush_id")
+                        if flush_id in manual_flushes:
+                            manual_flushes.discard(flush_id)
+                            if speaking:
+                                _finalize()
+                            else:
+                                # nothing was heard, but the flush still needs an answer or
+                                # the commit waits for its transcript timeout
+                                self._event_ch.send_nowait(
+                                    stt.SpeechEvent(
+                                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                        alternatives=[
+                                            stt.SpeechData(text="", language=self._opts.language)
+                                        ],
+                                    )
                                 )
-                            )
+                        elif pending_flush is not None and flush_id == pending_flush:
+                            _finalize()
                     elif type_ == "log":
                         log_server_message(data)
                     else:
@@ -649,7 +611,7 @@ class SpeechStream(stt.SpeechStream):
             try:
                 ws = await self._connect_ws()
                 self._input_ch.restart_provider_clock()
-                timeline.reset()
+                manual_flushes.clear()
                 tasks = [
                     asyncio.create_task(send_task(ws)),
                     asyncio.create_task(recv_task(ws)),
