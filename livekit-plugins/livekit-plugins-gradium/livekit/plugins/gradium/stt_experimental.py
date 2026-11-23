@@ -244,30 +244,16 @@ class STTExperimental(GradiumSTTBase):
         Parameter sets that work together, with the other options at their defaults:
 
         - Responsive: `min_silence_duration=0.1, max_silence_duration=2.0,
-          eot_threshold_start=0.4, eot_threshold_end=0.4`. Final 0.85 / 1.04; 4 cut in
-          45 runs.
-        - Balanced, the defaults. Final 0.89 / 1.16; 1 cut in 45 runs. With
-          `delay_in_frames=10`: 0.97 / 1.13, 2 cut.
+          eot_threshold_start=0.4, eot_threshold_end=0.4`.
+        - Balanced, the defaults. Final 0.89 / 1.16.
         - Patient: `min_silence_duration=0.3, max_silence_duration=3.0,
           eot_threshold_start=0.95, eot_threshold_end=0.6, eager_threshold=0.5,
-          preflight_trigger="eager"`. Final 1.31 / 1.62, but the preview starts the LLM at
-          0.84 / 1.11; 1 cut in 45 runs, for 51 previews, each an LLM request.
-
-        These were measured on 2026-11-23 against Gradium's hosted model with Silero, on
-        45 synthetic clips of one to three sentences, 18 of them with a scripted
-        mid-sentence pause of 0.6 s or 1.5 s. Times are seconds after the user stopped,
-        p50 / p90; "cut" counts turns ended inside a pause, and every cut was in a 1.5 s
-        pause. For comparison, `STT` with its defaults (delay 10): final 2.14 / 2.94, its
-        preview at 1.64 / 2.08, none cut.
+          preflight_trigger="eager"`.
 
         Args:
             vad: The local VAD. Prefer `inference.VAD(model="silero")`, the session's
-                default: the STT runs its own stream of it besides the session's, and
-                this one costs about 0.24% of a CPU core per participant, against 0.44%
-                for `silero.VAD.load()` (measured on 2026-11-23; both end turns the
-                same on the benchmark clips). Only its per-window speech probability is
-                used: its own thresholds and durations are ignored in favour of the
-                options below.
+                default. Only its per-window speech probability is used: its own thresholds
+                and durations are ignored in favour of the options below.
             api_key: Gradium API key; defaults to the `GRADIUM_API_KEY` environment
                 variable.
             model_endpoint: Websocket URL of the STT; defaults to
