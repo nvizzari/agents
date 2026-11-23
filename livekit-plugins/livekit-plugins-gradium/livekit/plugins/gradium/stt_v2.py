@@ -37,7 +37,7 @@ import json
 import os
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, get_args
 
@@ -66,8 +66,6 @@ EagerPreflightTrigger: TypeAlias = Literal["eager"]
 
 DELAYS_IN_FRAMES = (7, 8, 10, 12, 14, 16, 20, 24, 36, 48)
 """The `delay_in_frames` values Gradium accepts."""
-NUM_BUCKETS = 4
-"""Gradium sends one inactivity probability per horizon: 0.5, 1, 2 and 3 s."""
 _FRAME_S = 0.08
 _DEFAULT_DELAY_IN_FRAMES = 10
 # A word that ends this long after the local VAD placed the start of a pause was spoken
@@ -100,10 +98,10 @@ class STTV2Options:
     min_speech_duration: float
     min_silence: float
     max_silence: float
-    eot_bucket: int
+    eot_horizon: float
     eot_threshold_start: float
     eot_threshold_end: float
-    eager_bucket: int
+    eager_horizon: float
     eager_threshold: float | None
     preflight_trigger: EagerPreflightTrigger | None
 
@@ -128,10 +126,10 @@ class STTV2(stt.STT):
         min_speech_duration: float = 0.15,
         min_silence: float = 0.1,
         max_silence: float = 2.5,
-        eot_bucket: int = 3,
+        eot_horizon: float = 3.0,
         eot_threshold_start: float = 0.5,
         eot_threshold_end: float = 0.4,
-        eager_bucket: int = 2,
+        eager_horizon: float = 2.0,
         eager_threshold: float | None = None,
         preflight_trigger: EagerPreflightTrigger | None = None,
     ) -> None:
@@ -146,10 +144,10 @@ class STTV2(stt.STT):
            when the probability stays above `speech_threshold` for `min_speech_duration`
            again, or when Gradium sends a word that ended during the pause.
         3. Once the pause has lasted `min_silence`, each Gradium step is checked:
-           - Eager: when the `eager_bucket` probability reaches `eager_threshold`, the STT
+           - Eager: when the `eager_horizon` probability reaches `eager_threshold`, the STT
              flushes, which makes Gradium send the words its model delay still holds, and
              previews them as a `PREFLIGHT_TRANSCRIPT` so the session can start the LLM.
-           - Commit: when the `eot_bucket` probability reaches a threshold that falls from
+           - Commit: when the `eot_horizon` probability reaches a threshold that falls from
              `eot_threshold_start` (at `min_silence`) to `eot_threshold_end` (at
              `max_silence`), the turn ends: `FINAL_TRANSCRIPT` then `END_OF_SPEECH`, as
              soon as the flush is answered.
@@ -171,7 +169,7 @@ class STTV2(stt.STT):
           eot_threshold_start=0.5, eot_threshold_end=0.4`. Final 0.81 / 1.09; 6 premature
           ends in 90 runs.
         - Patient, speculative: `min_silence=0.3, max_silence=3.0, eot_threshold_start=0.95,
-          eot_threshold_end=0.6, eager_bucket=2, eager_threshold=0.5`. Final 1.21 / 1.55,
+          eot_threshold_end=0.6, eager_threshold=0.5`. Final 1.21 / 1.55,
           but the preview starts the LLM at 0.84 / 1.10; 1 premature end in 45 runs. Costs
           the LLM requests of the previews (52 in those 45 runs). Without the eager preview the same
           thresholds give a final at 1.56 / 2.07.
@@ -197,15 +195,18 @@ class STTV2(stt.STT):
                 latency.
             max_silence: Seconds of pause after which the turn ends whatever Gradium says.
                 The ceiling of the latency.
-            eot_bucket: Which Gradium horizon decides the end of turn: 0, 1, 2 or 3 for
-                0.5, 1, 2 or 3 s. A longer horizon asks "will the user stay quiet for
-                that long", so it is slower to rise and cuts fewer mid-sentence pauses.
-            eot_threshold_start: `eot_bucket` probability that ends the turn at
+            eot_horizon: Which of Gradium's inactivity horizons, in seconds, decides the
+                end of turn; the hosted model sends 0.5, 1, 2 and 3. A longer horizon asks
+                "will the user stay quiet for that long", so it is slower to rise and cuts
+                fewer mid-sentence pauses. A horizon the server does not send fails the
+                stream with an error naming the ones it sends.
+            eot_threshold_start: `eot_horizon` probability that ends the turn at
                 `min_silence`. Raise it to cut fewer pauses, lower it to end sooner.
-            eot_threshold_end: `eot_bucket` probability that ends the turn at
+            eot_threshold_end: `eot_horizon` probability that ends the turn at
                 `max_silence`; the threshold falls in a straight line in between.
-            eager_bucket: Which Gradium horizon triggers the eager flush and preview.
-            eager_threshold: `eager_bucket` probability that triggers them, once the pause
+            eager_horizon: Which Gradium horizon, in seconds, triggers the eager flush and
+                preview.
+            eager_threshold: `eager_horizon` probability that triggers them, once the pause
                 lasted `min_silence`. None flushes only at the commit, so the final comes
                 one flush round trip (about 0.25 s) after the decision; the local VAD can
                 still cancel the commit during that time if the user starts again, which
@@ -240,20 +241,20 @@ class STTV2(stt.STT):
             raise ValueError("min_speech_duration must be >= 0")
         if not 0.0 <= min_silence < max_silence:
             raise ValueError("expected 0 <= min_silence < max_silence")
-        for name, bucket in (("eot_bucket", eot_bucket), ("eager_bucket", eager_bucket)):
-            if not 0 <= bucket < NUM_BUCKETS:
-                raise ValueError(f"{name} must be within [0, {NUM_BUCKETS - 1}], got {bucket}")
+        for name, horizon in (("eot_horizon", eot_horizon), ("eager_horizon", eager_horizon)):
+            if horizon <= 0:
+                raise ValueError(f"{name} must be a positive number of seconds, got {horizon}")
         if preflight_trigger == "eager" and eager_threshold is None:
             raise ValueError("preflight_trigger='eager' needs an eager_threshold")
         if (
             eager_threshold is not None
-            and eager_bucket == eot_bucket
+            and eager_horizon == eot_horizon
             and eager_threshold >= eot_threshold_start
         ):
-            # the commit threshold only falls from eot_threshold_start: on the same bucket,
+            # the commit threshold only falls from eot_threshold_start: on the same horizon,
             # the commit is always decided first and the eager stage never runs
             raise ValueError(
-                f"eager_threshold ({eager_threshold}) on the commit's bucket must be below "
+                f"eager_threshold ({eager_threshold}) on the commit's horizon must be below "
                 f"eot_threshold_start ({eot_threshold_start})"
             )
 
@@ -294,10 +295,10 @@ class STTV2(stt.STT):
             min_speech_duration=min_speech_duration,
             min_silence=min_silence,
             max_silence=max_silence,
-            eot_bucket=eot_bucket,
+            eot_horizon=eot_horizon,
             eot_threshold_start=eot_threshold_start,
             eot_threshold_end=eot_threshold_end,
-            eager_bucket=eager_bucket,
+            eager_horizon=eager_horizon,
             eager_threshold=eager_threshold,
             preflight_trigger=preflight_trigger,
         )
@@ -400,7 +401,7 @@ class _TurnTracker:
         self._speaking = False
 
         # Gradium's latest step
-        self._probs: list[float] | None = None
+        self._probs: Mapping[float, float] | None = None
         self._probs_t = 0.0
 
         # the turn
@@ -471,8 +472,8 @@ class _TurnTracker:
             self._on_speech(onset=t - self._speech_run)
         self._evaluate()
 
-    def on_step(self, t: float, probs: list[float]) -> None:
-        """A Gradium step: inactivity probabilities for the audio up to `t`."""
+    def on_step(self, t: float, probs: Mapping[float, float]) -> None:
+        """A Gradium step: inactivity probability by horizon, for the audio up to `t`."""
         self._probs, self._probs_t = probs, t
         self._evaluate()
 
@@ -627,16 +628,18 @@ class _TurnTracker:
         if silence < o.min_silence:
             return
         # a step from before the pause still describes speech
-        probs = self._probs if self._probs_t >= self._speech_seen_t else None
+        probs = self._probs if self._probs_t >= self._speech_seen_t else {}
+        eot_prob = probs.get(o.eot_horizon) if probs else None
+        eager_prob = probs.get(o.eager_horizon) if probs else None
         if silence >= o.max_silence or (
-            probs is not None and probs[o.eot_bucket] >= self._eot_threshold(silence)
+            eot_prob is not None and eot_prob >= self._eot_threshold(silence)
         ):
             self._end_turn()
         elif (
             self._pause is _Pause.LISTENING
-            and probs is not None
+            and eager_prob is not None
             and o.eager_threshold is not None
-            and probs[o.eager_bucket] >= o.eager_threshold
+            and eager_prob >= o.eager_threshold
         ):
             self._flush_id = self._request_flush()
             self._pause = _Pause.PREVIEW_SENT
@@ -666,6 +669,13 @@ class _TurnTracker:
         if self._vad_wall is None:
             return None
         return self._vad_wall - (self._vad_t - t)
+
+
+def _horizons(step: dict[str, Any]) -> dict[float, float]:
+    """A step's inactivity probabilities by horizon in seconds; empty for a warm-up step."""
+    if step.get("total_duration_s", 0.0) <= 0:
+        return {}  # sent before any audio was processed: a warm-up estimate
+    return {float(v["horizon_s"]): float(v["inactivity_prob"]) for v in step.get("vad", [])}
 
 
 class SpeechStreamV2(stt.SpeechStream):
@@ -882,6 +892,8 @@ class SpeechStreamV2(stt.SpeechStream):
                 type_ = data.get("type", "")
                 if type_ == "error":
                     raise _api_error(data)
+                if type_ == "step":
+                    self._check_horizons(data)
                 if type_ == "end_of_stream":
                     if closing_ws:
                         tracker.commit()
@@ -907,6 +919,22 @@ class SpeechStreamV2(stt.SpeechStream):
         finally:
             await ws.close()
 
+    def _check_horizons(self, step: dict[str, Any]) -> None:
+        """Fail the stream, without retrying, on a step lacking a horizon the options use."""
+        sent = _horizons(step)
+        if not sent:
+            return  # a warm-up step
+        needed = {self._opts.eot_horizon}
+        if self._opts.eager_threshold is not None:
+            needed.add(self._opts.eager_horizon)
+        if missing := needed - sent.keys():
+            raise APIError(
+                f"Gradium sent no inactivity horizon {sorted(missing)}; "
+                f"it sends {sorted(sent)}: set eot_horizon and eager_horizon to one of them",
+                body=step,
+                retryable=False,
+            )
+
     def _handle_message(
         self, type_: str, data: dict[str, Any], offset: float, manual_flushes: set[int]
     ) -> None:
@@ -916,11 +944,8 @@ class SpeechStreamV2(stt.SpeechStream):
                 return  # held words of a turn that ended without them
             self._timed_out_flush = None
         if type_ == "step":
-            if data.get("total_duration_s", 0.0) <= 0:
-                return  # sent before any audio was processed: a warm-up estimate
-            probs = [
-                v["inactivity_prob"] for v in sorted(data["vad"], key=lambda v: v["horizon_s"])
-            ]
+            if not (probs := _horizons(data)):
+                return
             tracker.on_step(data["total_duration_s"] + offset, probs)
             self._mark_provider_progress()
         elif type_ == "text":

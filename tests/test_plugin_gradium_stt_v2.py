@@ -17,7 +17,7 @@ import aiohttp
 import pytest
 
 from livekit import rtc
-from livekit.agents import APIConnectOptions, APIStatusError
+from livekit.agents import APIConnectOptions, APIError
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.agents.vad import VAD, VADCapabilities, VADEvent, VADEventType, VADStream
 from livekit.plugins.gradium import STTV2
@@ -30,7 +30,8 @@ VAD_WINDOW_S = 0.032  # Silero's window at 16 kHz
 STEP_S = 0.08
 SPEECH = 0.9
 SILENCE = 0.05
-# Gradium probabilities, one per horizon (0.5, 1, 2, 3 s)
+HORIZONS = (0.5, 1.0, 2.0, 3.0)  # seconds, as the hosted model sends them
+# Gradium probabilities, one per horizon
 ENDED = [0.99, 0.99, 0.99, 0.99]
 UNSURE = [0.6, 0.4, 0.2, 0.1]
 
@@ -105,7 +106,7 @@ class _Timeline:
             self.t += VAD_WINDOW_S
             self.tracker.on_vad(self.t, prob, wall=self.t)
             if steps is not None and self.t >= next_step:
-                self.tracker.on_step(self.t, steps)
+                self.tracker.on_step(self.t, dict(zip(HORIZONS, steps, strict=True)))
                 next_step += STEP_S
 
     def word(self, text: str, stop_s: float | None = None) -> None:
@@ -304,7 +305,7 @@ def test_steps_from_before_the_pause_do_not_end_the_turn():
     tl = _Timeline()
     tl.speech(0.5)
     tl.word("hello")
-    tl.tracker.on_step(0.4, ENDED)
+    tl.tracker.on_step(0.4, dict(zip(HORIZONS, ENDED, strict=True)))
     tl.silence(0.2)  # no new step
     assert tl.flushes == []
 
@@ -364,14 +365,14 @@ def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
     [
         {"silence_threshold": 0.6, "speech_threshold": 0.5},
         {"min_silence": 1.0, "max_silence": 1.0},
-        {"eot_bucket": 4},
+        {"eot_horizon": 0.0},
         {"eot_threshold_start": 1.5},
         {"delay_in_frames": 9},
         {"preflight_trigger": "vad_trip"},
         # a preview needs the eager flush it comes from
         {"preflight_trigger": "eager"},
-        # on the commit's own bucket, the commit is always decided before the eager stage
-        {"eager_threshold": 0.6, "eager_bucket": 3, "eot_bucket": 3, "eot_threshold_start": 0.5},
+        # on the commit's own horizon, the commit is always decided before the eager stage
+        {"eager_threshold": 0.6, "eager_horizon": 3.0, "eot_threshold_start": 0.5},
     ],
 )
 def test_inconsistent_options_are_rejected(options):
@@ -433,11 +434,13 @@ async def _until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
             await asyncio.sleep(0.01)
 
 
-def _step(total_duration_s: float, prob: float) -> dict[str, Any]:
+def _step(
+    total_duration_s: float, prob: float, horizons: tuple[float, ...] = HORIZONS
+) -> dict[str, Any]:
     return {
         "type": "step",
         "total_duration_s": total_duration_s,
-        "vad": [{"horizon_s": h, "inactivity_prob": prob} for h in (0.5, 1, 2, 3)],
+        "vad": [{"horizon_s": h, "inactivity_prob": prob} for h in horizons],
     }
 
 
@@ -480,7 +483,7 @@ class _Stream:
         try:
             async for ev in self.stream:
                 self.events.append(ev)
-        except APIStatusError as e:
+        except APIError as e:
             self.error = e
 
     @property
@@ -678,3 +681,27 @@ async def test_pause_decided_after_the_input_ended_is_left_to_the_server():
         s.ws.server({"type": "end_of_stream"})
         await s.wait_for(SpeechEventType.END_OF_SPEECH)
         assert s.final_texts() == ["hello"]
+
+
+async def test_horizon_is_chosen_by_its_duration_not_its_position():
+    # A server that adds a horizon, or orders them differently, must not silently move
+    # the end of turn to another horizon.
+    async with _Stream() as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.quiet(0.3)
+        step = _step(0.7, 0.0, horizons=(3.0, 0.25, 0.5, 1.0, 2.0))
+        step["vad"][0]["inactivity_prob"] = 0.99  # only the 3 s horizon is sure
+        s.ws.server(step)
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+
+
+async def test_missing_horizon_fails_the_stream_with_a_clear_error():
+    # A horizon the server does not send can never end a turn: fail loudly, naming the
+    # horizons it does send, instead of retrying or holding every turn to max_silence.
+    async with _Stream(max_retry=3) as s:
+        s.ws.server(_step(0.1, 0.5, horizons=(0.5, 1.0, 2.0)))
+        await _until(lambda: s.error is not None)
+        assert "[0.5, 1.0, 2.0]" in str(s.error)
+        assert s.session.connects == 1
