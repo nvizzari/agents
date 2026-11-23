@@ -58,22 +58,27 @@ calls to ensure you still benefit from preemptive generation.
 
 ## End of turn with a local VAD: `STTExperimental`
 
-`STTExperimental` ends turns from two signals. A local VAD (Silero) says when the user went quiet or
-started again, with no network round trip, and Gradium's inactivity probabilities say whether
-the pause ends the turn. It owns the end of turn, so use it with STT turn detection:
+`STTExperimental` ends turns from two signals. A local VAD (Silero) says when the user went
+quiet or started again, with no network round trip, and Gradium's inactivity probabilities say
+whether the pause ends the turn. It owns the end of turn, so use it with STT turn detection:
 
 ```python
-from livekit.agents import AgentSession
-from livekit.plugins import gradium, silero
+from livekit.agents import AgentSession, inference
+from livekit.plugins import gradium
 
 session = AgentSession(
-    stt=gradium.STTExperimental(vad=silero.VAD.load()),
+    stt=gradium.STTExperimental(vad=inference.VAD(model="silero")),
     turn_handling={"turn_detection": "stt"},
     # llm=..., tts=...
 )
 ```
 
+The STT runs its own stream of the local VAD besides the session's. `inference.VAD`, the
+session's default VAD, keeps that cost to about 0.24% of a CPU core per participant, about half
+of what `silero.VAD.load()` costs.
+
 Its options trade latency against cutting users off mid-sentence. `STTExperimental`'s
 docstring lists parameter sets measured against Gradium's hosted model, from responsive to
-patient, and `update_options` changes them mid-session. The debug logs of the `livekit.plugins.gradium`
-logger say which rule ended each turn, with Gradium's probability and the threshold it met.
+patient, and `update_options` changes them mid-session. The debug logs of the
+`livekit.plugins.gradium` logger say which rule ended each turn, with Gradium's probability and
+the threshold it met.

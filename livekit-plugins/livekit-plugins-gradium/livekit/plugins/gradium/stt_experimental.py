@@ -261,12 +261,13 @@ class STTExperimental(GradiumSTTBase):
         preview at 1.64 / 2.08, none cut.
 
         Args:
-            vad: The local VAD, such as `silero.VAD.load()`. Only its per-window speech
-                probability is used: its own thresholds and durations
-                (`activation_threshold`, `min_speech_duration`, `min_silence_duration`
-                for Silero) are ignored in favour of the options below. The STT runs its
-                own stream of it, besides the session's, which doubles the VAD's CPU
-                cost per participant.
+            vad: The local VAD. Prefer `inference.VAD(model="silero")`, the session's
+                default: the STT runs its own stream of it besides the session's, and
+                this one costs about 0.24% of a CPU core per participant, against 0.44%
+                for `silero.VAD.load()` (measured on 2026-11-23; both end turns the
+                same on the benchmark clips). Only its per-window speech probability is
+                used: its own thresholds and durations are ignored in favour of the
+                options below.
             api_key: Gradium API key; defaults to the `GRADIUM_API_KEY` environment
                 variable.
             model_endpoint: Websocket URL of the STT; defaults to
