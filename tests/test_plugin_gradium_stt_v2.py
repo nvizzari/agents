@@ -148,6 +148,31 @@ def test_turn_ends_on_the_flush_reply_once_gradium_is_confident():
     assert tl.types()[-2:] == [SpeechEventType.FINAL_TRANSCRIPT, SpeechEventType.END_OF_SPEECH]
 
 
+def test_final_end_time_is_unknown_until_the_last_word_ends():
+    # The session takes the final's `end_time` as when the user stopped speaking; the end
+    # of an earlier word would place it too early.
+    tl = _spoken()
+    tl.tracker.on_text("friend")  # its end_text not in yet
+    tl.silence(0.2, steps=ENDED)
+    tl.reply()
+    final = next(e for e in tl.events if e.type == SpeechEventType.FINAL_TRANSCRIPT)
+    assert final.alternatives[0].end_time == 0.0
+
+
+def test_late_word_end_does_not_leak_into_the_next_turn():
+    # An `end_text` that arrives after its turn ended belongs to that turn, not the next.
+    tl = _spoken()
+    tl.silence(0.2, steps=ENDED)
+    tl.reply()
+    tl.tracker.on_end_text(0.6)
+    tl.speech(0.5)
+    tl.tracker.on_text("next")
+    tl.silence(0.2, steps=ENDED)
+    tl.reply()
+    finals = [e for e in tl.events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+    assert finals[-1].alternatives[0].end_time == 0.0
+
+
 def test_unsure_gradium_holds_the_turn_until_max_silence():
     # A mid-sentence pause (Gradium unsure) must not end the turn; `max_silence` caps how
     # long the user can be kept waiting.
@@ -462,6 +487,9 @@ async def test_after_a_reconnect_gradium_and_the_vad_stay_on_the_stream_clock():
         await _until(lambda: bool(ws2.sent_of("flush")))
         ws2.server({"type": "flushed", "flush_id": ws2.sent_of("flush")[0]["flush_id"]})
         await _until(lambda: SpeechEventType.END_OF_SPEECH in collector.types())
+        # the word ended 0.4 s into the stream, on the first connection's clock
+        final = next(e for e in collector.events if e.type == SpeechEventType.FINAL_TRANSCRIPT)
+        assert final.alternatives[0].end_time == pytest.approx(0.4, abs=0.05)
     finally:
         await collector.close(stream)
 

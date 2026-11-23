@@ -364,12 +364,10 @@ class _TurnTracker:
         *,
         emit: Callable[[stt.SpeechEvent], None],
         request_flush: Callable[[], int],
-        start_time_offset: Callable[[], float] = lambda: 0.0,
     ) -> None:
         self._opts = opts
         self._emit = emit
         self._request_flush = request_flush
-        self._start_time_offset = start_time_offset
         self.word_lag_s = _DEFAULT_DELAY_IN_FRAMES * _FRAME_S + _WORD_LAG_S
 
         # local VAD
@@ -392,7 +390,8 @@ class _TurnTracker:
         # - the latest audio time known to hold speech (a speech window of the local VAD or
         #   the end of a word): the current pause is measured from it;
         self._speech_seen_t = 0.0
-        # - the end of the turn's last word, for the final's `end_time`;
+        # - the end of the turn's last word, on the stream's clock, for the final's
+        #   `end_time`; None until the last word's end arrives;
         self._word_end_t: float | None = None
         # - since when speech has produced no word: the noise guard's clock.
         self._wordless_since = 0.0
@@ -447,11 +446,18 @@ class _TurnTracker:
             # its reply was spoken after the pause started
             self._resume()
         self._words.append(text)
+        self._word_end_t = None
         self._emit_text(stt.SpeechEventType.INTERIM_TRANSCRIPT, " ".join(self._words))
 
-    def on_end_text(self, stop_s: float) -> None:
-        """The end, in audio time, of the word Gradium sent last."""
-        self._word_end_t = stop_s
+    def on_end_text(self, stop_s: float, *, stream_time: float | None = None) -> None:
+        """The end of the word Gradium sent last, in audio time.
+
+        `stream_time` is the same instant on the stream's clock, the one `end_time` uses;
+        it differs from audio time after a reconnect.
+        """
+        if not self._turn_open:
+            return  # a late end of the last turn's last word
+        self._word_end_t = stop_s if stream_time is None else stream_time
         self._wordless_since = max(self._wordless_since, stop_s)
         if stop_s <= self._speech_seen_t:
             return
@@ -488,13 +494,10 @@ class _TurnTracker:
         if not self._turn_open:
             return
         text = " ".join(self._words)
-        offset = self._start_time_offset()
         end_t = self._word_end_t
         alternatives = [
             stt.SpeechData(
-                text=text,
-                language=self._opts.language,
-                end_time=end_t + offset if end_t is not None else 0.0,
+                text=text, language=self._opts.language, end_time=end_t if end_t else 0.0
             )
         ]
         self._emit(
@@ -652,10 +655,7 @@ class SpeechStreamV2(stt.SpeechStream):
         # when to stop waiting for the reply to each pending flush, in event-loop time
         self._flush_deadlines: dict[int, float] = {}
         self._tracker = _TurnTracker(
-            opts,
-            emit=self._event_ch.send_nowait,
-            request_flush=self._request_turn_flush,
-            start_time_offset=lambda: self.start_time_offset,
+            opts, emit=self._event_ch.send_nowait, request_flush=self._request_turn_flush
         )
 
     def _request_turn_flush(self) -> int:
@@ -842,7 +842,10 @@ class SpeechStreamV2(stt.SpeechStream):
             tracker.on_text(data["text"])
             self._mark_provider_progress()
         elif type_ == "end_text":
-            tracker.on_end_text(data["stop_s"] + offset)
+            # Gradium's clock restarts with each connection, as does `start_time_offset`,
+            # the stream time of the connection's first frame
+            stop_s = data["stop_s"]
+            tracker.on_end_text(stop_s + offset, stream_time=stop_s + self.start_time_offset)
             self._mark_provider_progress()
         elif type_ == "flushed":
             flush_id = data.get("flush_id")
