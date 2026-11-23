@@ -55,3 +55,25 @@ closer to the last words, which risks triggering two LLM calls. The preview is s
 only when new words arrive, so a VAD that flickers during a silence keeps the request already
 started. When tuning the VAD parameters, also check the number of LLM
 calls to ensure you still benefit from preemptive generation.
+
+## End of turn with a local VAD: `STTV2`
+
+`STTV2` ends turns from two signals. A local VAD (Silero) says when the user went quiet or
+started again, with no network round trip, and Gradium's inactivity probabilities say whether
+the pause ends the turn. It owns the end of turn, so use it with STT turn detection:
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import gradium, silero
+
+session = AgentSession(
+    stt=gradium.STTV2(vad=silero.VAD.load()),
+    turn_handling={"turn_detection": "stt"},
+    # llm=..., tts=...
+)
+```
+
+Its options trade latency against cutting users off mid-sentence. `STTV2`'s docstring lists
+parameter sets measured against Gradium's hosted model, from responsive to patient, and
+`update_options` changes them mid-session. The debug logs of the `livekit.plugins.gradium`
+logger say which rule ended each turn, with Gradium's probability and the threshold it met.

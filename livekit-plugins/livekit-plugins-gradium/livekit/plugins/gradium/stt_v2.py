@@ -16,13 +16,12 @@
 
 The local VAD (Silero) says *when* the user went quiet or started again; it runs on the
 audio as it arrives, with no network round trip and no model delay. Gradium's per-step
-inactivity probabilities say *whether* a pause ends the turn. The turn ends once the pause
-has lasted `min_silence_duration` and Gradium's probability is above a threshold that falls the
-longer the pause lasts, or once it has lasted `max_silence_duration`.
+inactivity probabilities say *whether* a pause ends the turn. `STTV2.__init__` documents
+the rules.
 
 Every time below is in seconds of audio since the stream started ("audio time"): the local
 VAD reports the audio it processed, and a Gradium `step` describes the audio up to its
-`total_duration_s` (measured: after the user resumes, the buckets react within one or two
+`total_duration_s` (measured: after the user resumes, the horizons react within one or two
 steps whatever the model delay), so both line up without correction.
 """
 
@@ -195,87 +194,127 @@ class STTV2(stt.STT):
     ) -> None:
         """Create a Gradium STT that ends turns from a local VAD and Gradium's semantic VAD.
 
-        Use it with `AgentSession(turn_detection="stt", ...)`: the STT owns the end of turn.
+        The STT owns the end of turn only with
+        `AgentSession(turn_handling={"turn_detection": "stt"}, ...)`. With any other turn
+        detection the session ignores its end-of-turn events, and the local VAD stream it
+        runs is wasted.
 
-        How a turn ends:
+        How a turn ends. The rules are checked on every local VAD window (about every
+        32 ms) and every Gradium step (every 80 ms):
 
         1. The local `vad` hears speech for `min_speech_duration`: the turn starts.
-        2. Its speech probability falls below `silence_threshold`: a pause starts. It ends
-           when the probability stays above `speech_threshold` for `min_speech_duration`
-           again, or when Gradium sends a word that ended during the pause.
-        3. Once the pause has lasted `min_silence_duration`, each Gradium step is checked:
-           - Eager: when the `eager_horizon` probability reaches `eager_threshold`, the STT
-             flushes, which makes Gradium send the words its model delay still holds, and
-             previews them as a `PREFLIGHT_TRANSCRIPT` so the session can start the LLM.
-           - Commit: when the `eot_horizon` probability reaches a threshold that falls from
-             `eot_threshold_start` (at `min_silence_duration`) to `eot_threshold_end` (at
-             `max_silence_duration`), the turn ends: `FINAL_TRANSCRIPT` then
-             `END_OF_SPEECH`, as soon as the flush is answered.
-        4. After `max_silence_duration` of pause the turn ends whatever Gradium says.
+        2. Its speech probability falls below `silence_threshold`: a pause starts. The pause
+           ends, and the turn goes on, when the probability is at or above
+           `speech_threshold` for `min_speech_duration` (windows in between neither add up
+           nor reset), or when Gradium sends a word that ended during the pause.
+        3. Once the pause has lasted `min_silence_duration`:
+           - Eager, when `eager_threshold` is set: once the `eager_horizon` probability
+             reaches it, the STT flushes, which makes Gradium send the words its model
+             delay still holds. With `preflight_trigger="eager"` it then previews them as a
+             `PREFLIGHT_TRANSCRIPT` so the session can start the LLM.
+           - Commit: once the `eot_horizon` probability reaches a threshold that falls in
+             a straight line from `eot_threshold_start` (at `min_silence_duration`) toward
+             `eot_threshold_end` (at `max_silence_duration`), the turn ends:
+             `FINAL_TRANSCRIPT` then `END_OF_SPEECH`, as soon as the flush is answered.
+        4. Once the pause has lasted `max_silence_duration`, the turn ends whatever Gradium
+           says.
 
-        If the user starts again before the commit, the pending end is dropped, and a stale
-        preview is superseded by an `INTERIM_TRANSCRIPT` so the session drops its early
-        LLM request.
+        If the user starts again before the commit, the pending end is dropped, and an
+        `INTERIM_TRANSCRIPT` supersedes a preview so the session drops its early LLM
+        request. Three more rules end a turn:
+        - Background noise: the local VAD keeps hearing speech, but Gradium has
+          transcribed no word for `max_silence_duration` plus its word lag (the model
+          delay plus about 0.6 s).
+        - The audio stops reaching the STT (track ended, microphone muted) for
+          `max_silence_duration`.
+        - The stream fails for good, after its retries.
+        The debug logs of `livekit.plugins.gradium` say which rule ended each turn.
 
-        Parameter sets that work together, with the other options at their defaults. They
-        were measured live against Gradium (delay 7, Silero) on 45 synthetic clips of one to
-        three sentences, 18 of them with a scripted mid-sentence pause of 0.6 s or 1.5 s.
-        Times are seconds after the user stopped, p50 / p90; every premature end was in a
-        1.5 s pause:
+        The session still waits `endpointing.min_delay` (0.5 s by default) after the end
+        of speech this STT reports before replying. Turns here end 0.7 s or more after the
+        user stopped, so it rarely adds anything; a lower value, e.g.
+        `turn_handling={"turn_detection": "stt", "endpointing": {"min_delay": 0.2}}`,
+        makes sure it never does.
+
+        Parameter sets that work together, with the other options at their defaults:
 
         - Responsive: `min_silence_duration=0.1, max_silence_duration=2.0,
-          eot_threshold_start=0.4, eot_threshold_end=0.4`. Final 0.78 / 0.98; 12 premature
-          ends in 90 runs.
-        - Balanced, the defaults: `min_silence_duration=0.1, max_silence_duration=2.5,
-          eot_threshold_start=0.5, eot_threshold_end=0.4`. Final 0.81 / 1.09; 6 premature
-          ends in 90 runs.
-        - Patient, speculative: `min_silence_duration=0.3, max_silence_duration=3.0,
-          eot_threshold_start=0.95, eot_threshold_end=0.6, eager_threshold=0.5`. Final
-          1.21 / 1.55, but the preview starts the LLM at 0.84 / 1.10; 1 premature end in 45
-          runs. Costs the LLM requests of the previews (52 in those 45 runs). Without the
-          eager preview the same thresholds give a final at 1.56 / 2.07.
+          eot_threshold_start=0.4, eot_threshold_end=0.4`. Final 0.85 / 1.04; 4 cut in
+          45 runs.
+        - Balanced, the defaults. Final 0.89 / 1.16; 1 cut in 45 runs. With
+          `delay_in_frames=10`: 0.97 / 1.13, 2 cut.
+        - Patient: `min_silence_duration=0.3, max_silence_duration=3.0,
+          eot_threshold_start=0.95, eot_threshold_end=0.6, eager_threshold=0.5,
+          preflight_trigger="eager"`. Final 1.31 / 1.62, but the preview starts the LLM at
+          0.84 / 1.11; 1 cut in 45 runs, for 51 previews, each an LLM request.
 
-        For comparison, `STT` with its defaults: final 1.97 / 2.38, no premature end.
+        These were measured on 2026-11-23 against Gradium's hosted model with Silero, on
+        45 synthetic clips of one to three sentences, 18 of them with a scripted
+        mid-sentence pause of 0.6 s or 1.5 s. Times are seconds after the user stopped,
+        p50 / p90; "cut" counts turns ended inside a pause, and every cut was in a 1.5 s
+        pause. For comparison, `STT` with its defaults (delay 10): final 2.14 / 2.94, its
+        preview at 1.64 / 2.08, none cut.
 
         Args:
             vad: The local VAD, such as `silero.VAD.load()`. Only its per-window speech
-                probability is used; its own speech and silence durations are ignored.
-                The STT runs its own stream of it, besides the session's.
+                probability is used: its own thresholds and durations
+                (`activation_threshold`, `min_speech_duration`, `min_silence_duration`
+                for Silero) are ignored in favour of the options below. The STT runs its
+                own stream of it, besides the session's, which doubles the VAD's CPU
+                cost per participant.
+            api_key: Gradium API key; defaults to the `GRADIUM_API_KEY` environment
+                variable.
+            model_endpoint: Websocket URL of the STT; defaults to
+                `GRADIUM_MODEL_ENDPOINT`, then to Gradium's hosted endpoint.
+            model_name: Gradium model to use.
+            http_session: The aiohttp session to connect with; defaults to the job's.
+            language: Language of the speech, e.g. `"en"`, `"fr"`, or `"any"` to detect it.
+            temperature: Sampling temperature of the transcription, from 0 (the server's
+                default, greedy) to 1.
+            keywords: Words or phrases to favor in the transcript, such as product names.
+            keyword_boost: How strongly to favor `keywords`; the server defaults to 2.0.
+            log_level: Opt in to the server's log messages, such as a warning about an
+                unknown setup option: the lowest level to receive ("debug", "info",
+                "warning" or "error"), written to the `livekit.plugins.gradium` logger.
             delay_in_frames: Gradium's model delay, in 80 ms frames: one of 7, 8, 10, 12,
-                14, 16, 20, 24, 36, 48. Lower sends words sooner, and so makes the flush
-                and the final transcript faster; higher can transcribe more accurately.
-                None uses the server's default (10).
+                14, 16, 20, 24, 36, 48. Lower sends words sooner, so the flush and the
+                final are faster; higher can transcribe more accurately. None uses the
+                server's default (10, which `STT` also uses).
             speech_threshold: Local VAD probability at or above which a window is speech.
             silence_threshold: Local VAD probability below which a window is silence.
-                Between the two, the VAD keeps its state: the gap is the hysteresis that
-                stops a probability hovering around one threshold from flapping.
-            min_speech_duration: Seconds of continuous speech that start a turn, or end a
-                pause. Higher ignores coughs and clicks, but reacts later to the user
-                starting again.
-            min_silence_duration: Seconds of pause before the turn may end. The floor of
+                The gap between the two is a hysteresis: a probability hovering around
+                one threshold does not flap between speech and silence.
+            min_speech_duration: Seconds of speech that start a turn, or end a pause.
+                Higher ignores coughs and clicks, but notices the user starting again
+                later.
+            min_silence_duration: Seconds of pause before the turn may end: the floor of
                 the latency.
             max_silence_duration: Seconds of pause after which the turn ends whatever
-                Gradium says. The ceiling of the latency.
+                Gradium says: the ceiling of the latency. It also sets how fast the commit
+                threshold falls, and how long the noise and stalled-audio rules wait, so
+                raising it makes every turn a little slower, not only the doubtful ones.
             eot_horizon: Which of Gradium's inactivity horizons, in seconds, decides the
                 end of turn; the hosted model sends 0.5, 1, 2 and 3. A longer horizon asks
-                "will the user stay quiet for that long", so it is slower to rise and cuts
-                fewer mid-sentence pauses. A horizon the server does not send fails the
-                stream with an error naming the ones it sends.
+                "will the user stay quiet for that long", so it rises later and cuts fewer
+                mid-sentence pauses. A horizon the server does not send fails the stream
+                with an error naming the ones it sends.
             eot_threshold_start: `eot_horizon` probability that ends the turn at
-                `min_silence_duration`. Raise it to cut fewer pauses, lower it to end sooner.
-            eot_threshold_end: `eot_horizon` probability that ends the turn at
-                `max_silence_duration`; the threshold falls in a straight line in between.
-            eager_horizon: Which Gradium horizon, in seconds, triggers the eager flush and
-                preview.
-            eager_threshold: `eager_horizon` probability that triggers them, once the pause
-                lasted `min_silence_duration`. None flushes only at the commit, so the final comes
-                one flush round trip (about 0.25 s) after the decision; the local VAD can
-                still cancel the commit during that time if the user starts again, which
-                measurably avoids premature turns. An eager flush answered before the
-                decision gives up that window: pair it with a stricter commit threshold.
+                `min_silence_duration`. Raise it to cut fewer pauses, lower it to end
+                sooner.
+            eot_threshold_end: The threshold at `max_silence_duration`, at most
+                `eot_threshold_start`. The turn ends there anyway, so this only sets the
+                slope.
+            eager_horizon: Which Gradium horizon, in seconds, triggers the eager flush.
+            eager_threshold: `eager_horizon` probability that triggers the eager flush;
+                None, the default, flushes only at the commit. Then the final comes one
+                flush round trip (about 0.25 s) after the decision, and the local VAD can
+                still cancel the commit in that time if the user starts again, which
+                measurably avoids cut turns. An eager flush answered before the decision
+                gives that window up: pair it with a stricter commit threshold.
             preflight_trigger: `"eager"` previews the words as a `PREFLIGHT_TRANSCRIPT`
                 when the eager flush is answered, so it needs `eager_threshold`; None, the
-                default, never previews.
+                default, never previews. Each preview the user then talks past costs a
+                cancelled LLM request.
         """
         opts = STTV2Options(
             language=LanguageCode(language),
