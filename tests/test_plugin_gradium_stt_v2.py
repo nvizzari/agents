@@ -268,7 +268,12 @@ def test_last_word_ending_just_after_the_vad_pause_does_not_resume():
 def test_eager_flush_previews_the_words_and_a_resume_supersedes_the_preview():
     # The eager stage lets the session start the LLM before the turn ends; when the user
     # resumes, an interim after the preview is what tells the session the preview is stale.
-    tl = _spoken(eot_threshold_start=0.95, eot_threshold_end=0.95, eager_threshold=0.5)
+    tl = _spoken(
+        eot_threshold_start=0.95,
+        eot_threshold_end=0.95,
+        eager_threshold=0.5,
+        preflight_trigger="eager",
+    )
     tl.silence(0.2, steps=[0.0, 0.0, 0.6, 0.0])
     tl.reply()
     assert tl.texts(SpeechEventType.PREFLIGHT_TRANSCRIPT) == ["hello there"]
@@ -280,7 +285,12 @@ def test_eager_flush_previews_the_words_and_a_resume_supersedes_the_preview():
 
 def test_words_after_the_flush_reply_resume_the_turn():
     # The reply carries every word spoken before the flush, so a later word is new speech.
-    tl = _spoken(eot_threshold_start=0.95, eot_threshold_end=0.95, eager_threshold=0.5)
+    tl = _spoken(
+        eot_threshold_start=0.95,
+        eot_threshold_end=0.95,
+        eager_threshold=0.5,
+        preflight_trigger="eager",
+    )
     tl.silence(0.2, steps=[0.0, 0.0, 0.6, 0.0])
     tl.reply()
     tl.word("and", stop_s=tl.t)
@@ -358,6 +368,10 @@ def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
         {"eot_threshold_start": 1.5},
         {"delay_in_frames": 9},
         {"preflight_trigger": "vad_trip"},
+        # a preview needs the eager flush it comes from
+        {"preflight_trigger": "eager"},
+        # on the commit's own bucket, the commit is always decided before the eager stage
+        {"eager_threshold": 0.6, "eager_bucket": 3, "eot_bucket": 3, "eot_threshold_start": 0.5},
     ],
 )
 def test_inconsistent_options_are_rejected(options):

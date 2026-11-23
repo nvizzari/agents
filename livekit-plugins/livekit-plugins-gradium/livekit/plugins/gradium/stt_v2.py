@@ -133,7 +133,7 @@ class STTV2(stt.STT):
         eot_threshold_end: float = 0.4,
         eager_bucket: int = 2,
         eager_threshold: float | None = None,
-        preflight_trigger: EagerPreflightTrigger | None = "eager",
+        preflight_trigger: EagerPreflightTrigger | None = None,
     ) -> None:
         """Create a Gradium STT that ends turns from a local VAD and Gradium's semantic VAD.
 
@@ -212,7 +212,8 @@ class STTV2(stt.STT):
                 measurably avoids premature turns. An eager flush answered before the
                 decision gives up that window: pair it with a stricter commit threshold.
             preflight_trigger: `"eager"` previews the words as a `PREFLIGHT_TRANSCRIPT`
-                when the eager flush is answered; None never previews.
+                when the eager flush is answered, so it needs `eager_threshold`; None, the
+                default, never previews.
         """
         if preflight_trigger is not None and preflight_trigger not in get_args(
             EagerPreflightTrigger
@@ -242,6 +243,19 @@ class STTV2(stt.STT):
         for name, bucket in (("eot_bucket", eot_bucket), ("eager_bucket", eager_bucket)):
             if not 0 <= bucket < NUM_BUCKETS:
                 raise ValueError(f"{name} must be within [0, {NUM_BUCKETS - 1}], got {bucket}")
+        if preflight_trigger == "eager" and eager_threshold is None:
+            raise ValueError("preflight_trigger='eager' needs an eager_threshold")
+        if (
+            eager_threshold is not None
+            and eager_bucket == eot_bucket
+            and eager_threshold >= eot_threshold_start
+        ):
+            # the commit threshold only falls from eot_threshold_start: on the same bucket,
+            # the commit is always decided first and the eager stage never runs
+            raise ValueError(
+                f"eager_threshold ({eager_threshold}) on the commit's bucket must be below "
+                f"eot_threshold_start ({eot_threshold_start})"
+            )
 
         super().__init__(
             capabilities=stt.STTCapabilities(
