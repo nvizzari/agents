@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import dataclasses
+import enum
 import json
 import os
 import time
@@ -326,6 +327,27 @@ class STTV2(stt.STT):
         return stream
 
 
+class _Pause(enum.Enum):
+    """Where the current pause stands; every stage but LISTENING has a flush id.
+
+    LISTENING -> PREVIEW_SENT -> PREVIEWED: the eager flush and its reply.
+    LISTENING, PREVIEW_SENT or PREVIEWED -> ENDING -> CONFIRMING -> commit: the end of
+    the turn is decided, its flush answered, and it commits once the decision still holds.
+    Any stage -> LISTENING when the user talks again.
+    """
+
+    LISTENING = enum.auto()
+    """No flush for this pause."""
+    PREVIEW_SENT = enum.auto()
+    """The eager flush is in flight."""
+    PREVIEWED = enum.auto()
+    """The eager flush is answered: every word spoken before it has arrived."""
+    ENDING = enum.auto()
+    """The end of the turn is decided; its flush is in flight."""
+    CONFIRMING = enum.auto()
+    """The end of the turn is decided and its flush answered."""
+
+
 class _TurnTracker:
     """The end-of-turn state machine; synchronous and free of I/O, so it can be replayed.
 
@@ -354,9 +376,6 @@ class _TurnTracker:
         self._vad_wall: float | None = None
         self._speech_run = 0.0
         self._speaking = False
-        # latest audio time known to hold speech: the last speech window of the local VAD,
-        # or the end of the last word; a pause is measured from it
-        self._speech_seen_t = 0.0
 
         # Gradium's latest step
         self._probs: list[float] | None = None
@@ -365,12 +384,17 @@ class _TurnTracker:
         # the turn
         self._turn_open = False
         self._words: list[str] = []
-        self._last_word_t = 0.0  # end of the last word, or the start of the turn
-        self._speech_end_t: float | None = None  # end of the last word, when Gradium sent it
+        self._pause = _Pause.LISTENING
         self._flush_id: int | None = None
-        self._flush_answered = False
-        self._commit_pending = False
-        self._preflight_text = ""
+        self._preview_text = ""
+        # Three times, each with one use:
+        # - the latest audio time known to hold speech (a speech window of the local VAD or
+        #   the end of a word): the current pause is measured from it;
+        self._speech_seen_t = 0.0
+        # - the end of the turn's last word, for the final's `end_time`;
+        self._word_end_t: float | None = None
+        # - since when speech has produced no word: the noise guard's clock.
+        self._wordless_since = 0.0
 
     @property
     def turn_open(self) -> bool:
@@ -378,8 +402,10 @@ class _TurnTracker:
 
     @property
     def pending_flush(self) -> int | None:
-        """The id of the flush sent for this pause and not answered yet."""
-        return None if self._flush_answered else self._flush_id
+        """The id of this pause's flush while its reply is awaited."""
+        if self._pause in (_Pause.PREVIEW_SENT, _Pause.ENDING):
+            return self._flush_id
+        return None
 
     def set_delay_in_frames(self, delay: int) -> None:
         self.word_lag_s = delay * _FRAME_S + _WORD_LAG_S
@@ -415,7 +441,7 @@ class _TurnTracker:
             # the local VAD missed this speech; until the word's end arrives, its arrival
             # is the only evidence of when it was spoken
             self._speech_seen_t = max(self._speech_seen_t, self._vad_t)
-        elif self._flush_answered:
+        elif self._pause in (_Pause.PREVIEWED, _Pause.CONFIRMING):
             # the flush returned every word the model held when it was sent: a word after
             # its reply was spoken after the pause started
             self._resume()
@@ -424,8 +450,8 @@ class _TurnTracker:
 
     def on_end_text(self, stop_s: float) -> None:
         """The end, in audio time, of the word Gradium sent last."""
-        self._speech_end_t = stop_s
-        self._last_word_t = max(self._last_word_t, stop_s)
+        self._word_end_t = stop_s
+        self._wordless_since = max(self._wordless_since, stop_s)
         if stop_s <= self._speech_seen_t:
             return
         if self._turn_open and not self._speaking:
@@ -434,21 +460,27 @@ class _TurnTracker:
         self._speech_seen_t = stop_s
 
     def on_flushed(self, flush_id: int) -> None:
-        if flush_id != self._flush_id or self._flush_answered:
+        if flush_id != self._flush_id:
             return  # the flush of a pause the user has since ended
-        self._flush_answered = True
+        if self._pause is _Pause.PREVIEW_SENT:
+            self._pause = _Pause.PREVIEWED
+        elif self._pause is _Pause.ENDING:
+            self._pause = _Pause.CONFIRMING
+        else:
+            return
         self._evaluate()
         if self._turn_open and self._opts.preflight_trigger == "eager":
             text = " ".join(self._words)
-            if text and text != self._preflight_text:
-                self._preflight_text = text
+            if text and text != self._preview_text:
+                self._preview_text = text
                 self._emit_text(stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, text)
 
     def on_flush_lost(self) -> None:
         """The pending flush will never be answered (reconnect): send a new one if needed."""
-        self._flush_id = None
-        self._flush_answered = False
-        self._evaluate()
+        if self._pause is _Pause.PREVIEW_SENT:
+            self._pause, self._flush_id = _Pause.LISTENING, None
+        elif self._pause is _Pause.ENDING:
+            self._flush_id = self._request_flush()
 
     def commit(self) -> None:
         """End the open turn now with the words received so far."""
@@ -456,7 +488,7 @@ class _TurnTracker:
             return
         text = " ".join(self._words)
         offset = self._start_time_offset()
-        end_t = self._speech_end_t
+        end_t = self._word_end_t
         alternatives = [
             stt.SpeechData(
                 text=text,
@@ -476,12 +508,12 @@ class _TurnTracker:
         )
         self._turn_open = False
         self._words = []
-        self._speech_end_t = None
+        self._word_end_t = None
         self._reset_pause()
 
     def _open_turn(self, onset: float | None) -> None:
         self._turn_open = True
-        self._last_word_t = onset if onset is not None else self._vad_t
+        self._wordless_since = onset if onset is not None else self._vad_t
         self._reset_pause()
         self._emit(
             stt.SpeechEvent(
@@ -498,17 +530,16 @@ class _TurnTracker:
 
     def _resume(self) -> None:
         """The user is talking again: the pause did not end the turn."""
-        stale_preview = bool(self._preflight_text)
+        stale_preview = bool(self._preview_text)
         self._reset_pause()
         if stale_preview and self._words:
             # an interim after a preview is how the session learns the preview is stale
             self._emit_text(stt.SpeechEventType.INTERIM_TRANSCRIPT, " ".join(self._words))
 
     def _reset_pause(self) -> None:
+        self._pause = _Pause.LISTENING
         self._flush_id = None
-        self._flush_answered = False
-        self._commit_pending = False
-        self._preflight_text = ""
+        self._preview_text = ""
 
     def _eot_threshold(self, silence: float) -> float:
         o = self._opts
@@ -524,37 +555,47 @@ class _TurnTracker:
         if self._speaking:
             # The local VAD hears speech but Gradium has transcribed nothing for far longer
             # than its delay: background noise, which would otherwise hold the turn open.
-            if now - self._last_word_t >= o.max_silence + self.word_lag_s:
-                self._commit_pending = True
-                self._advance_commit()
+            if now - self._wordless_since >= o.max_silence + self.word_lag_s:
+                self._end_turn()
             return
 
-        silence = now - self._speech_seen_t
-        if not self._commit_pending:
-            if silence < o.min_silence:
+        match self._pause:
+            case _Pause.CONFIRMING:
+                self.commit()
                 return
-            # a step from before the pause still describes speech
-            probs = self._probs if self._probs_t >= self._speech_seen_t else None
-            if silence >= o.max_silence or (
-                probs is not None and probs[o.eot_bucket] >= self._eot_threshold(silence)
-            ):
-                self._commit_pending = True
-            elif (
-                probs is not None
-                and o.eager_threshold is not None
-                and self._flush_id is None
-                and probs[o.eager_bucket] >= o.eager_threshold
-            ):
-                self._flush_id = self._request_flush()
+            case _Pause.ENDING:
                 return
-        if self._commit_pending:
-            self._advance_commit()
 
-    def _advance_commit(self) -> None:
-        if self._flush_id is None:
+        silence = now - self._speech_seen_t
+        if silence < o.min_silence:
+            return
+        # a step from before the pause still describes speech
+        probs = self._probs if self._probs_t >= self._speech_seen_t else None
+        if silence >= o.max_silence or (
+            probs is not None and probs[o.eot_bucket] >= self._eot_threshold(silence)
+        ):
+            self._end_turn()
+        elif (
+            self._pause is _Pause.LISTENING
+            and probs is not None
+            and o.eager_threshold is not None
+            and probs[o.eager_bucket] >= o.eager_threshold
+        ):
             self._flush_id = self._request_flush()
-        elif self._flush_answered:
-            self.commit()
+            self._pause = _Pause.PREVIEW_SENT
+
+    def _end_turn(self) -> None:
+        """The turn should end: commit once a flush has returned every held word."""
+        match self._pause:
+            case _Pause.LISTENING:
+                self._flush_id = self._request_flush()
+                self._pause = _Pause.ENDING
+            case _Pause.PREVIEW_SENT:
+                self._pause = _Pause.ENDING  # its reply will do
+            case _Pause.PREVIEWED | _Pause.CONFIRMING:
+                self.commit()
+            case _Pause.ENDING:
+                pass
 
     def _emit_text(self, type_: stt.SpeechEventType, text: str) -> None:
         self._emit(
