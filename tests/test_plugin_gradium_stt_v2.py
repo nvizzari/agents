@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -173,6 +174,19 @@ def test_late_word_end_does_not_leak_into_the_next_turn():
     tl.reply()
     finals = [e for e in tl.events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
     assert finals[-1].alternatives[0].end_time == 0.0
+
+
+def test_why_a_turn_ended_is_logged(caplog):
+    # A user tuning the knobs after "the agent cut me off" needs to know which rule ended
+    # the turn and how close Gradium was to its threshold.
+    tl = _spoken()
+    with caplog.at_level(logging.DEBUG, logger="livekit.plugins.gradium"):
+        tl.silence(0.2, steps=ENDED)
+        tl.reply()
+    decided = next(r for r in caplog.records if r.getMessage().startswith("end of turn decided"))
+    assert decided.reason == "gradium"  # type: ignore[attr-defined]
+    assert decided.probability == 0.99  # type: ignore[attr-defined]
+    assert decided.threshold == pytest.approx(0.5, abs=0.01)  # type: ignore[attr-defined]
 
 
 def test_unsure_gradium_holds_the_turn_until_max_silence():
@@ -705,3 +719,14 @@ async def test_missing_horizon_fails_the_stream_with_a_clear_error():
         await _until(lambda: s.error is not None)
         assert "[0.5, 1.0, 2.0]" in str(s.error)
         assert s.session.connects == 1
+
+
+async def test_events_carry_gradium_request_id():
+    # The session records the provider's request ids on its traces, and Gradium's support
+    # needs them to look a session up.
+    async with _Stream() as s:
+        s.ws.server({"type": "ready", "request_id": "req-1", "delay_in_frames": 7})
+        flush_id = await s.pause_ends_turn()
+        s.ws.server({"type": "flushed", "flush_id": flush_id})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert {e.request_id for e in s.events} == {"req-1"}

@@ -410,6 +410,7 @@ class _TurnTracker:
         self._pause = _Pause.LISTENING
         self._flush_id: int | None = None
         self._preview_text = ""
+        self._end_reason = ""  # why the end of the turn was decided, for the logs
         # Three times, each with one use:
         # - the latest audio time known to hold speech (a speech window of the local VAD or
         #   the end of a word): the current pause is measured from it;
@@ -446,7 +447,7 @@ class _TurnTracker:
             return
         self._speaking = False
         self._speech_run = 0.0
-        self._end_turn()
+        self._end_turn("audio_stalled")
 
     def set_delay_in_frames(self, delay: int) -> None:
         self.word_lag_s = delay * _FRAME_S + _WORD_LAG_S
@@ -486,7 +487,7 @@ class _TurnTracker:
         elif self._pause in (_Pause.PREVIEWED, _Pause.CONFIRMING):
             # the flush returned every word the model held when it was sent: a word after
             # its reply was spoken after the pause started
-            self._resume()
+            self._resume("word after the flush reply")
         self._words.append(text)
         self._word_end_t = None
         self._emit_text(stt.SpeechEventType.INTERIM_TRANSCRIPT, " ".join(self._words))
@@ -505,7 +506,7 @@ class _TurnTracker:
             return
         if self._turn_open and not self._speaking:
             if stop_s > self._speech_seen_t + _WORD_RESUME_MARGIN_S:
-                self._resume()
+                self._resume("word ended during the pause")
         self._speech_seen_t = stop_s
 
     def on_flushed(self, flush_id: int) -> None:
@@ -531,11 +532,19 @@ class _TurnTracker:
         elif self._pause is _Pause.ENDING:
             self._flush_id = self._request_flush()
 
-    def commit(self) -> None:
-        """End the open turn now with the words received so far."""
+    def commit(self, reason: str = "") -> None:
+        """End the open turn now with the words received so far.
+
+        `reason` names what ended it, for the logs; by default, why the end was decided.
+        """
         if not self._turn_open:
             return
         text = " ".join(self._words)
+        logger.debug(
+            "turn ended: %s",
+            reason or self._end_reason,
+            extra={"reason": reason or self._end_reason, "words": len(self._words)},
+        )
         end_t = self._word_end_t
         alternatives = [
             stt.SpeechData(
@@ -575,10 +584,17 @@ class _TurnTracker:
             # the words of the resumed speech are a model delay away: the noise guard
             # must not count the pause, or it ends the turn mid-sentence after a long one
             self._wordless_since = max(self._wordless_since, onset)
-            self._resume()
+            self._resume("local VAD heard speech")
 
-    def _resume(self) -> None:
+    def _resume(self, cause: str) -> None:
         """The user is talking again: the pause did not end the turn."""
+        if self._pause is not _Pause.LISTENING:
+            logger.debug(
+                "user resumed (%s), dropping the %s pause",
+                cause,
+                self._pause.name,
+                extra={"cause": cause, "flush_id": self._flush_id},
+            )
         stale_preview = bool(self._preview_text)
         self._reset_pause()
         if stale_preview and self._words:
@@ -589,6 +605,7 @@ class _TurnTracker:
         self._pause = _Pause.LISTENING
         self._flush_id = None
         self._preview_text = ""
+        self._end_reason = ""
 
     def _eot_threshold(self, silence: float) -> float:
         o = self._opts
@@ -605,7 +622,7 @@ class _TurnTracker:
             # The local VAD hears speech but Gradium has transcribed nothing for far longer
             # than its delay: background noise, which would otherwise hold the turn open.
             if now - self._wordless_since >= o.max_silence + self.word_lag_s:
-                self._end_turn()
+                self._end_turn("no_words", wordless=now - self._wordless_since)
             elif self._pause is not _Pause.LISTENING:
                 # only the guard decides while the user speaks, and the words its flush
                 # brought back show the speech was real: drop the decision
@@ -631,10 +648,11 @@ class _TurnTracker:
         probs = self._probs if self._probs_t >= self._speech_seen_t else {}
         eot_prob = probs.get(o.eot_horizon) if probs else None
         eager_prob = probs.get(o.eager_horizon) if probs else None
-        if silence >= o.max_silence or (
-            eot_prob is not None and eot_prob >= self._eot_threshold(silence)
-        ):
-            self._end_turn()
+        threshold = self._eot_threshold(silence)
+        if silence >= o.max_silence:
+            self._end_turn("max_silence", silence=silence)
+        elif eot_prob is not None and eot_prob >= threshold:
+            self._end_turn("gradium", silence=silence, probability=eot_prob, threshold=threshold)
         elif (
             self._pause is _Pause.LISTENING
             and eager_prob is not None
@@ -643,9 +661,16 @@ class _TurnTracker:
         ):
             self._flush_id = self._request_flush()
             self._pause = _Pause.PREVIEW_SENT
+            logger.debug(
+                "eager flush",
+                extra={"silence": silence, "probability": eager_prob, "flush_id": self._flush_id},
+            )
 
-    def _end_turn(self) -> None:
+    def _end_turn(self, reason: str, **details: float) -> None:
         """The turn should end: commit once a flush has returned every held word."""
+        if self._pause in (_Pause.LISTENING, _Pause.PREVIEW_SENT, _Pause.PREVIEWED):
+            self._end_reason = reason
+            logger.debug("end of turn decided: %s", reason, extra={"reason": reason, **details})
         match self._pause:
             case _Pause.LISTENING:
                 self._flush_id = self._request_flush()
@@ -714,9 +739,13 @@ class SpeechStreamV2(stt.SpeechStream):
         # after a flush timed out and ended the turn, its words may still come: they
         # belong to that turn, so drop them until its reply, or until this event-loop time
         self._timed_out_flush: tuple[int, float] | None = None
-        self._tracker = _TurnTracker(
-            opts, emit=self._event_ch.send_nowait, request_flush=self._request_turn_flush
-        )
+        # Gradium's id for the current connection, on every event for support and traces
+        self._request_id = ""
+        self._tracker = _TurnTracker(opts, emit=self._emit, request_flush=self._request_turn_flush)
+
+    def _emit(self, event: stt.SpeechEvent) -> None:
+        event.request_id = self._request_id
+        self._event_ch.send_nowait(event)
 
     def _next_flush_id(self) -> int:
         self._last_flush_id += 1
@@ -756,7 +785,7 @@ class SpeechStreamV2(stt.SpeechStream):
             # The turn survives a reconnect, so a transient failure must not end it while
             # the user is talking; only when the stream gives up are its words final.
             if not e.retryable or self._num_retries >= self._conn_options.max_retry:
-                self._tracker.commit()
+                self._tracker.commit("stream failed")
             raise
         finally:
             await utils.aio.cancel_and_wait(ws_task, vad_task, watchdog, flush_timer)
@@ -860,7 +889,7 @@ class SpeechStreamV2(stt.SpeechStream):
                     msg = await asyncio.wait_for(monitor.receive(), timeout=5.0)
                 except asyncio.TimeoutError:
                     if closing_ws:
-                        tracker.commit()
+                        tracker.commit("no end_of_stream reply")
                         return
                     continue
 
@@ -870,7 +899,7 @@ class SpeechStreamV2(stt.SpeechStream):
                     aiohttp.WSMsgType.CLOSING,
                 ):
                     if closing_ws:
-                        tracker.commit()
+                        tracker.commit("connection closed after the input")
                         return
                     raise APIStatusError(
                         "Gradium connection closed unexpectedly",
@@ -896,7 +925,7 @@ class SpeechStreamV2(stt.SpeechStream):
                     self._check_horizons(data)
                 if type_ == "end_of_stream":
                     if closing_ws:
-                        tracker.commit()
+                        tracker.commit("end_of_stream")
                         return
                     raise APIStatusError(
                         "Gradium ended the session while input was still open",
@@ -968,10 +997,10 @@ class SpeechStreamV2(stt.SpeechStream):
             if flush_id in manual_flushes:
                 manual_flushes.discard(flush_id)
                 if tracker.turn_open:
-                    tracker.commit()
+                    tracker.commit("session flush")
                 else:
                     # nothing was heard, but the caller's flush still needs a final
-                    self._event_ch.send_nowait(
+                    self._emit(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                             alternatives=[stt.SpeechData(text="", language=self._opts.language)],
@@ -980,6 +1009,8 @@ class SpeechStreamV2(stt.SpeechStream):
             else:
                 tracker.on_flushed(flush_id)
         elif type_ == "ready":
+            if isinstance(request_id := data.get("request_id"), str):
+                self._request_id = request_id
             if isinstance(delay := data.get("delay_in_frames"), int) and delay > 0:
                 tracker.set_delay_in_frames(delay)
         elif type_ == "log":
