@@ -267,6 +267,36 @@ def test_noise_heard_as_speech_without_words_ends_the_turn():
     assert tl.types(SpeechEventType.END_OF_SPEECH) == [SpeechEventType.END_OF_SPEECH]
 
 
+def test_noise_guard_does_not_count_the_pause_before_resumed_speech():
+    # After a long hesitation, the words of the resumed speech arrive a model delay after
+    # it starts; the guard must wait for them from the resumption, not from the last word
+    # before the pause, or it cuts the user's sentence in half.
+    tl = _spoken(max_silence=2.5)
+    tl.silence(2.2, steps=UNSURE)
+    tl.speech(2.0)  # no word transcribed yet
+    assert tl.flushes == []
+
+
+def test_noise_guard_drops_its_decision_once_words_arrive():
+    # The guard's flush often brings back the very words it was waiting for: the user is
+    # talking, so neither a preview nor the next dip between two words may end the turn.
+    tl = _Timeline(max_silence=1.0)
+    tl.speech(1.0 + tl.tracker.word_lag_s + 0.1)
+    assert len(tl.flushes) == 1
+
+    tl.word("I", stop_s=tl.t)
+    tl.reply()
+    tl.speech(0.032, prob=0.1)  # a stop consonant
+    assert (
+        tl.types(
+            SpeechEventType.PREFLIGHT_TRANSCRIPT,
+            SpeechEventType.FINAL_TRANSCRIPT,
+            SpeechEventType.END_OF_SPEECH,
+        )
+        == []
+    )
+
+
 def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
     # When the local VAD heard nothing, the word's arrival is the only evidence of speech:
     # the pause is measured from it, not from the last speech the VAD heard.

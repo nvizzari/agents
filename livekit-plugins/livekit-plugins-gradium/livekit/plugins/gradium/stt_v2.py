@@ -469,7 +469,7 @@ class _TurnTracker:
         else:
             return
         self._evaluate()
-        if self._turn_open and self._opts.preflight_trigger == "eager":
+        if self._pause is _Pause.PREVIEWED and self._opts.preflight_trigger == "eager":
             text = " ".join(self._words)
             if text and text != self._preview_text:
                 self._preview_text = text
@@ -526,6 +526,9 @@ class _TurnTracker:
         if not self._turn_open:
             self._open_turn(onset)
         else:
+            # the words of the resumed speech are a model delay away: the noise guard
+            # must not count the pause, or it ends the turn mid-sentence after a long one
+            self._wordless_since = max(self._wordless_since, onset)
             self._resume()
 
     def _resume(self) -> None:
@@ -557,6 +560,10 @@ class _TurnTracker:
             # than its delay: background noise, which would otherwise hold the turn open.
             if now - self._wordless_since >= o.max_silence + self.word_lag_s:
                 self._end_turn()
+            elif self._pause is not _Pause.LISTENING:
+                # only the guard decides while the user speaks, and the words its flush
+                # brought back show the speech was real: drop the decision
+                self._reset_pause()
             return
 
         match self._pause:
