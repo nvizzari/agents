@@ -17,8 +17,8 @@
 The local VAD (Silero) says *when* the user went quiet or started again; it runs on the
 audio as it arrives, with no network round trip and no model delay. Gradium's per-step
 inactivity probabilities say *whether* a pause ends the turn. The turn ends once the pause
-has lasted `min_silence` and Gradium's probability is above a threshold that falls the
-longer the pause lasts, or once it has lasted `max_silence`.
+has lasted `min_silence_duration` and Gradium's probability is above a threshold that falls the
+longer the pause lasts, or once it has lasted `max_silence_duration`.
 
 Every time below is in seconds of audio since the stream started ("audio time"): the local
 VAD reports the audio it processed, and a Gradium `step` describes the audio up to its
@@ -96,8 +96,8 @@ class STTV2Options:
     speech_threshold: float
     silence_threshold: float
     min_speech_duration: float
-    min_silence: float
-    max_silence: float
+    min_silence_duration: float
+    max_silence_duration: float
     eot_horizon: float
     eot_threshold_start: float
     eot_threshold_end: float
@@ -124,8 +124,8 @@ class STTV2(stt.STT):
         speech_threshold: float = 0.5,
         silence_threshold: float = 0.35,
         min_speech_duration: float = 0.15,
-        min_silence: float = 0.1,
-        max_silence: float = 2.5,
+        min_silence_duration: float = 0.1,
+        max_silence_duration: float = 2.5,
         eot_horizon: float = 3.0,
         eot_threshold_start: float = 0.5,
         eot_threshold_end: float = 0.4,
@@ -143,15 +143,15 @@ class STTV2(stt.STT):
         2. Its speech probability falls below `silence_threshold`: a pause starts. It ends
            when the probability stays above `speech_threshold` for `min_speech_duration`
            again, or when Gradium sends a word that ended during the pause.
-        3. Once the pause has lasted `min_silence`, each Gradium step is checked:
+        3. Once the pause has lasted `min_silence_duration`, each Gradium step is checked:
            - Eager: when the `eager_horizon` probability reaches `eager_threshold`, the STT
              flushes, which makes Gradium send the words its model delay still holds, and
              previews them as a `PREFLIGHT_TRANSCRIPT` so the session can start the LLM.
            - Commit: when the `eot_horizon` probability reaches a threshold that falls from
-             `eot_threshold_start` (at `min_silence`) to `eot_threshold_end` (at
-             `max_silence`), the turn ends: `FINAL_TRANSCRIPT` then `END_OF_SPEECH`, as
-             soon as the flush is answered.
-        4. After `max_silence` of pause the turn ends whatever Gradium says.
+             `eot_threshold_start` (at `min_silence_duration`) to `eot_threshold_end` (at
+             `max_silence_duration`), the turn ends: `FINAL_TRANSCRIPT` then
+             `END_OF_SPEECH`, as soon as the flush is answered.
+        4. After `max_silence_duration` of pause the turn ends whatever Gradium says.
 
         If the user starts again before the commit, the pending end is dropped, and a stale
         preview is superseded by an `INTERIM_TRANSCRIPT` so the session drops its early
@@ -163,16 +163,17 @@ class STTV2(stt.STT):
         Times are seconds after the user stopped, p50 / p90; every premature end was in a
         1.5 s pause:
 
-        - Responsive: `min_silence=0.1, max_silence=2.0, eot_threshold_start=0.4,
-          eot_threshold_end=0.4`. Final 0.78 / 0.98; 12 premature ends in 90 runs.
-        - Balanced, the defaults: `min_silence=0.1, max_silence=2.5,
+        - Responsive: `min_silence_duration=0.1, max_silence_duration=2.0,
+          eot_threshold_start=0.4, eot_threshold_end=0.4`. Final 0.78 / 0.98; 12 premature
+          ends in 90 runs.
+        - Balanced, the defaults: `min_silence_duration=0.1, max_silence_duration=2.5,
           eot_threshold_start=0.5, eot_threshold_end=0.4`. Final 0.81 / 1.09; 6 premature
           ends in 90 runs.
-        - Patient, speculative: `min_silence=0.3, max_silence=3.0, eot_threshold_start=0.95,
-          eot_threshold_end=0.6, eager_threshold=0.5`. Final 1.21 / 1.55,
-          but the preview starts the LLM at 0.84 / 1.10; 1 premature end in 45 runs. Costs
-          the LLM requests of the previews (52 in those 45 runs). Without the eager preview the same
-          thresholds give a final at 1.56 / 2.07.
+        - Patient, speculative: `min_silence_duration=0.3, max_silence_duration=3.0,
+          eot_threshold_start=0.95, eot_threshold_end=0.6, eager_threshold=0.5`. Final
+          1.21 / 1.55, but the preview starts the LLM at 0.84 / 1.10; 1 premature end in 45
+          runs. Costs the LLM requests of the previews (52 in those 45 runs). Without the
+          eager preview the same thresholds give a final at 1.56 / 2.07.
 
         For comparison, `STT` with its defaults: final 1.97 / 2.38, no premature end.
 
@@ -191,23 +192,23 @@ class STTV2(stt.STT):
             min_speech_duration: Seconds of continuous speech that start a turn, or end a
                 pause. Higher ignores coughs and clicks, but reacts later to the user
                 starting again.
-            min_silence: Seconds of pause before the turn may end. The floor of the
-                latency.
-            max_silence: Seconds of pause after which the turn ends whatever Gradium says.
-                The ceiling of the latency.
+            min_silence_duration: Seconds of pause before the turn may end. The floor of
+                the latency.
+            max_silence_duration: Seconds of pause after which the turn ends whatever
+                Gradium says. The ceiling of the latency.
             eot_horizon: Which of Gradium's inactivity horizons, in seconds, decides the
                 end of turn; the hosted model sends 0.5, 1, 2 and 3. A longer horizon asks
                 "will the user stay quiet for that long", so it is slower to rise and cuts
                 fewer mid-sentence pauses. A horizon the server does not send fails the
                 stream with an error naming the ones it sends.
             eot_threshold_start: `eot_horizon` probability that ends the turn at
-                `min_silence`. Raise it to cut fewer pauses, lower it to end sooner.
+                `min_silence_duration`. Raise it to cut fewer pauses, lower it to end sooner.
             eot_threshold_end: `eot_horizon` probability that ends the turn at
-                `max_silence`; the threshold falls in a straight line in between.
+                `max_silence_duration`; the threshold falls in a straight line in between.
             eager_horizon: Which Gradium horizon, in seconds, triggers the eager flush and
                 preview.
             eager_threshold: `eager_horizon` probability that triggers them, once the pause
-                lasted `min_silence`. None flushes only at the commit, so the final comes
+                lasted `min_silence_duration`. None flushes only at the commit, so the final comes
                 one flush round trip (about 0.25 s) after the decision; the local VAD can
                 still cancel the commit during that time if the user starts again, which
                 measurably avoids premature turns. An eager flush answered before the
@@ -239,8 +240,8 @@ class STTV2(stt.STT):
             raise ValueError("silence_threshold must not be above speech_threshold")
         if min_speech_duration < 0:
             raise ValueError("min_speech_duration must be >= 0")
-        if not 0.0 <= min_silence < max_silence:
-            raise ValueError("expected 0 <= min_silence < max_silence")
+        if not 0.0 <= min_silence_duration < max_silence_duration:
+            raise ValueError("expected 0 <= min_silence_duration < max_silence_duration")
         for name, horizon in (("eot_horizon", eot_horizon), ("eager_horizon", eager_horizon)):
             if horizon <= 0:
                 raise ValueError(f"{name} must be a positive number of seconds, got {horizon}")
@@ -293,8 +294,8 @@ class STTV2(stt.STT):
             speech_threshold=speech_threshold,
             silence_threshold=silence_threshold,
             min_speech_duration=min_speech_duration,
-            min_silence=min_silence,
-            max_silence=max_silence,
+            min_silence_duration=min_silence_duration,
+            max_silence_duration=max_silence_duration,
             eot_horizon=eot_horizon,
             eot_threshold_start=eot_threshold_start,
             eot_threshold_end=eot_threshold_end,
@@ -609,7 +610,9 @@ class _TurnTracker:
 
     def _eot_threshold(self, silence: float) -> float:
         o = self._opts
-        frac = (silence - o.min_silence) / (o.max_silence - o.min_silence)
+        frac = (silence - o.min_silence_duration) / (
+            o.max_silence_duration - o.min_silence_duration
+        )
         frac = min(max(frac, 0.0), 1.0)
         return o.eot_threshold_start + (o.eot_threshold_end - o.eot_threshold_start) * frac
 
@@ -621,7 +624,7 @@ class _TurnTracker:
         if self._speaking:
             # The local VAD hears speech but Gradium has transcribed nothing for far longer
             # than its delay: background noise, which would otherwise hold the turn open.
-            if now - self._wordless_since >= o.max_silence + self.word_lag_s:
+            if now - self._wordless_since >= o.max_silence_duration + self.word_lag_s:
                 self._end_turn("no_words", wordless=now - self._wordless_since)
             elif self._pause is not _Pause.LISTENING:
                 # only the guard decides while the user speaks, and the words its flush
@@ -642,15 +645,15 @@ class _TurnTracker:
                 return
 
         silence = now - self._speech_seen_t
-        if silence < o.min_silence:
+        if silence < o.min_silence_duration:
             return
         # a step from before the pause still describes speech
         probs = self._probs if self._probs_t >= self._speech_seen_t else {}
         eot_prob = probs.get(o.eot_horizon) if probs else None
         eager_prob = probs.get(o.eager_horizon) if probs else None
         threshold = self._eot_threshold(silence)
-        if silence >= o.max_silence:
-            self._end_turn("max_silence", silence=silence)
+        if silence >= o.max_silence_duration:
+            self._end_turn("max_silence_duration", silence=silence)
         elif eot_prob is not None and eot_prob >= threshold:
             self._end_turn("gradium", silence=silence, probability=eot_prob, threshold=threshold)
         elif (
@@ -819,14 +822,14 @@ class SpeechStreamV2(stt.SpeechStream):
                 self._timed_out_flush = (flush_id, loop.time() + _FLUSH_REPLY_TIMEOUT_S)
 
     async def _stall_watchdog(self) -> None:
-        """End the open turn once no audio has reached the local VAD for `max_silence`."""
+        """End the open turn once no audio has reached the local VAD for `max_silence_duration`."""
         tracker = self._tracker
         while True:
             await asyncio.sleep(_STALL_CHECK_S)
             vad_t, vad_wall = tracker.vad_time
             if not tracker.turn_open or vad_wall is None or self._input_ch.closed:
                 continue
-            if time.time() - vad_wall < self._opts.max_silence:
+            if time.time() - vad_wall < self._opts.max_silence_duration:
                 continue
             if not self._input_ch.empty() or self._audio_pushed_s - vad_t > _VAD_BACKLOG_S:
                 continue  # the audio is late (backlog, reconnect), not missing

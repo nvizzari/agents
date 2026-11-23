@@ -190,9 +190,9 @@ def test_why_a_turn_ended_is_logged(caplog):
 
 
 def test_unsure_gradium_holds_the_turn_until_max_silence():
-    # A mid-sentence pause (Gradium unsure) must not end the turn; `max_silence` caps how
+    # A mid-sentence pause (Gradium unsure) must not end the turn; `max_silence_duration` caps how
     # long the user can be kept waiting.
-    tl = _spoken(max_silence=1.5)
+    tl = _spoken(max_silence_duration=1.5)
     tl.silence(1.4, steps=UNSURE)
     assert tl.flushes == []
 
@@ -205,7 +205,12 @@ def test_unsure_gradium_holds_the_turn_until_max_silence():
 def test_commit_threshold_falls_as_the_pause_lasts():
     # The threshold slides from `eot_threshold_start` to `eot_threshold_end`: a probability
     # too low to end the turn early ends it later in the pause.
-    tl = _spoken(min_silence=0.1, max_silence=2.1, eot_threshold_start=0.9, eot_threshold_end=0.1)
+    tl = _spoken(
+        min_silence_duration=0.1,
+        max_silence_duration=2.1,
+        eot_threshold_start=0.9,
+        eot_threshold_end=0.1,
+    )
     probs = [0.0, 0.0, 0.0, 0.5]
     tl.silence(0.9, steps=probs)  # threshold still above 0.5
     assert tl.flushes == []
@@ -327,7 +332,7 @@ def test_steps_from_before_the_pause_do_not_end_the_turn():
 def test_noise_heard_as_speech_without_words_ends_the_turn():
     # Background noise that the local VAD calls speech would hold a turn open forever;
     # with no word from Gradium long past its delay, the turn ends anyway.
-    tl = _Timeline(max_silence=1.0)
+    tl = _Timeline(max_silence_duration=1.0)
     tl.speech(1.0 + tl.tracker.word_lag_s + 0.1)
     assert len(tl.flushes) == 1
     tl.reply()
@@ -338,7 +343,7 @@ def test_noise_guard_does_not_count_the_pause_before_resumed_speech():
     # After a long hesitation, the words of the resumed speech arrive a model delay after
     # it starts; the guard must wait for them from the resumption, not from the last word
     # before the pause, or it cuts the user's sentence in half.
-    tl = _spoken(max_silence=2.5)
+    tl = _spoken(max_silence_duration=2.5)
     tl.silence(2.2, steps=UNSURE)
     tl.speech(2.0)  # no word transcribed yet
     assert tl.flushes == []
@@ -347,7 +352,7 @@ def test_noise_guard_does_not_count_the_pause_before_resumed_speech():
 def test_noise_guard_drops_its_decision_once_words_arrive():
     # The guard's flush often brings back the very words it was waiting for: the user is
     # talking, so neither a preview nor the next dip between two words may end the turn.
-    tl = _Timeline(max_silence=1.0)
+    tl = _Timeline(max_silence_duration=1.0)
     tl.speech(1.0 + tl.tracker.word_lag_s + 0.1)
     assert len(tl.flushes) == 1
 
@@ -367,7 +372,7 @@ def test_noise_guard_drops_its_decision_once_words_arrive():
 def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
     # When the local VAD heard nothing, the word's arrival is the only evidence of speech:
     # the pause is measured from it, not from the last speech the VAD heard.
-    tl = _Timeline(max_silence=1.0)
+    tl = _Timeline(max_silence_duration=1.0)
     tl.silence(3.0)
     tl.word("psst", stop_s=0.0)  # its end not known yet: stop_s from an old clock
     tl.silence(0.5)
@@ -378,7 +383,7 @@ def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
     "options",
     [
         {"silence_threshold": 0.6, "speech_threshold": 0.5},
-        {"min_silence": 1.0, "max_silence": 1.0},
+        {"min_silence_duration": 1.0, "max_silence_duration": 1.0},
         {"eot_horizon": 0.0},
         {"eot_threshold_start": 1.5},
         {"delay_in_frames": 9},
@@ -476,7 +481,8 @@ class _Stream:
         self.sockets = [_QueueWebSocket(auto_eos=auto_eos) for _ in range(connections)]
         self.session = _Session(self.sockets)
         self.vad = _ScriptedVAD()
-        stt = STTV2(vad=self.vad, api_key="test-key", http_session=self.session, **overrides)  # type: ignore[arg-type]
+        session: Any = self.session
+        stt = STTV2(vad=self.vad, api_key="test-key", http_session=session, **overrides)
         self.stream = stt.stream(
             conn_options=APIConnectOptions(max_retry=max_retry, retry_interval=0.1, timeout=5)
         )
@@ -573,7 +579,7 @@ async def test_after_a_reconnect_gradium_and_the_vad_stay_on_the_stream_clock():
     # A reconnect restarts Gradium's clock and the local VAD stream at 0. Both must be
     # re-anchored to the audio already consumed, or the pause of the open turn is measured
     # against the wrong times and never ends on the new connection's steps.
-    async with _Stream(connections=2, max_retry=1, max_silence=5.0) as s:
+    async with _Stream(connections=2, max_retry=1, max_silence_duration=5.0) as s:
         await s.speak(0.4)
         s.word("hello", stop_s=0.4)
         await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
@@ -619,7 +625,7 @@ async def test_words_are_final_when_the_stream_gives_up():
 async def test_turn_ends_when_the_audio_stops():
     # A track that ends or a muted microphone stops the audio mid-turn; time only moves
     # with the audio, so without a watchdog the turn would stay open forever.
-    async with _Stream(max_silence=1.0) as s:
+    async with _Stream(max_silence_duration=1.0) as s:
         await s.speak(0.4)
         s.word("hello", stop_s=0.4)
         await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
@@ -713,7 +719,7 @@ async def test_horizon_is_chosen_by_its_duration_not_its_position():
 
 async def test_missing_horizon_fails_the_stream_with_a_clear_error():
     # A horizon the server does not send can never end a turn: fail loudly, naming the
-    # horizons it does send, instead of retrying or holding every turn to max_silence.
+    # horizons it does send, instead of retrying or holding every turn to max_silence_duration.
     async with _Stream(max_retry=3) as s:
         s.ws.server(_step(0.1, 0.5, horizons=(0.5, 1.0, 2.0)))
         await _until(lambda: s.error is not None)
