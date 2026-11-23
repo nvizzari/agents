@@ -374,6 +374,7 @@ class _TurnTracker:
         self._vad_t = 0.0
         self._vad_wall: float | None = None
         self._speech_run = 0.0
+        self._speech_window_t = 0.0  # end of the last window at or above speech_threshold
         self._speaking = False
 
         # Gradium's latest step
@@ -416,6 +417,7 @@ class _TurnTracker:
         self._vad_t, self._vad_wall = t, wall
         if prob >= self._opts.speech_threshold:
             self._speech_run += dt
+            self._speech_window_t = t
         elif prob < self._opts.silence_threshold:
             self._speech_run = 0.0
 
@@ -568,6 +570,11 @@ class _TurnTracker:
                 # only the guard decides while the user speaks, and the words its flush
                 # brought back show the speech was real: drop the decision
                 self._reset_pause()
+            return
+
+        if self._speech_run > 0 and now - self._speech_window_t <= o.min_speech_duration:
+            # speech may be resuming, and neither the local VAD nor Gradium's buckets can
+            # tell yet: decide nothing until it is confirmed or dies out
             return
 
         match self._pause:

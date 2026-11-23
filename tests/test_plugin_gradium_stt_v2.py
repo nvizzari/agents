@@ -214,6 +214,22 @@ def test_user_resuming_before_the_reply_keeps_the_turn_open():
     assert tl.finals() == ["hello there friend"]
 
 
+def test_reply_during_resumed_speech_not_yet_confirmed_does_not_end_the_turn():
+    # Speech confirmation takes `min_speech_duration`: a flush reply that lands inside it
+    # must wait for the verdict instead of committing on a pause that is over.
+    tl = _spoken()
+    tl.silence(0.2, steps=ENDED)
+    tl.speech(0.064)  # resuming, not confirmed yet
+    tl.reply()
+    assert SpeechEventType.FINAL_TRANSCRIPT not in tl.types()
+
+    tl.speech(0.15)
+    tl.word("friend")
+    tl.silence(0.2, steps=ENDED)
+    tl.reply()
+    assert tl.finals() == ["hello there friend"]
+
+
 def test_short_noise_and_hovering_probability_do_not_end_a_pause():
     # Hysteresis: a click shorter than `min_speech_duration` does not resume the turn, and a
     # probability between the two thresholds does not flap the speech state.
