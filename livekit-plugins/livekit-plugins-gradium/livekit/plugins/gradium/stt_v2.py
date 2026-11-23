@@ -87,23 +87,83 @@ _VAD_BACKLOG_S = 0.1
 
 @dataclass
 class STTV2Options:
-    language: LanguageCode
-    temperature: float | None
-    keywords: list[str] | None
-    keyword_boost: float | None
-    log_level: LogLevel | None
-    delay_in_frames: int | None
-    speech_threshold: float
-    silence_threshold: float
-    min_speech_duration: float
-    min_silence_duration: float
-    max_silence_duration: float
-    eot_horizon: float
-    eot_threshold_start: float
-    eot_threshold_end: float
-    eager_horizon: float
-    eager_threshold: float | None
-    preflight_trigger: EagerPreflightTrigger | None
+    """`STTV2`'s options, with its defaults; an instance is always consistent.
+
+    `STTV2.__init__` documents each field.
+    """
+
+    language: LanguageCode = LanguageCode("en")
+    temperature: float | None = None
+    keywords: list[str] | None = None
+    keyword_boost: float | None = None
+    log_level: LogLevel | None = None
+    delay_in_frames: int | None = 7
+    speech_threshold: float = 0.5
+    silence_threshold: float = 0.35
+    min_speech_duration: float = 0.15
+    min_silence_duration: float = 0.1
+    max_silence_duration: float = 2.5
+    eot_horizon: float = 3.0
+    eot_threshold_start: float = 0.5
+    eot_threshold_end: float = 0.4
+    eager_horizon: float = 2.0
+    eager_threshold: float | None = None
+    preflight_trigger: EagerPreflightTrigger | None = None
+
+    def __post_init__(self) -> None:
+        if self.preflight_trigger is not None and self.preflight_trigger not in get_args(
+            EagerPreflightTrigger
+        ):
+            raise ValueError(
+                f"unknown preflight_trigger {self.preflight_trigger!r}, "
+                f"expected one of {get_args(EagerPreflightTrigger)} or None"
+            )
+        if self.delay_in_frames is not None and self.delay_in_frames not in DELAYS_IN_FRAMES:
+            raise ValueError(
+                f"delay_in_frames must be one of {DELAYS_IN_FRAMES} or None, "
+                f"got {self.delay_in_frames}"
+            )
+        for name in ("speech_threshold", "silence_threshold", "eot_threshold_start"):
+            if not 0.0 <= (value := getattr(self, name)) <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1], got {value}")
+        if not 0.0 <= self.eot_threshold_end <= self.eot_threshold_start:
+            raise ValueError(
+                f"eot_threshold_end ({self.eot_threshold_end}) must be within "
+                f"[0, eot_threshold_start ({self.eot_threshold_start})]: the threshold falls"
+            )
+        if self.eager_threshold is not None and not 0.0 <= self.eager_threshold <= 1.0:
+            raise ValueError(f"eager_threshold must be within [0, 1], got {self.eager_threshold}")
+        if self.silence_threshold > self.speech_threshold:
+            raise ValueError(
+                f"silence_threshold ({self.silence_threshold}) must not be above "
+                f"speech_threshold ({self.speech_threshold})"
+            )
+        if self.min_speech_duration < 0:
+            raise ValueError(f"min_speech_duration must be >= 0, got {self.min_speech_duration}")
+        if not 0.0 <= self.min_silence_duration < self.max_silence_duration:
+            raise ValueError(
+                f"expected 0 <= min_silence_duration ({self.min_silence_duration}) "
+                f"< max_silence_duration ({self.max_silence_duration})"
+            )
+        for name in ("eot_horizon", "eager_horizon"):
+            if (horizon := getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be a positive number of seconds, got {horizon}")
+        if self.preflight_trigger == "eager" and self.eager_threshold is None:
+            raise ValueError("preflight_trigger='eager' needs an eager_threshold")
+        if (
+            self.eager_threshold is not None
+            and self.eager_horizon == self.eot_horizon
+            and self.eager_threshold >= self.eot_threshold_start
+        ):
+            # the commit threshold only falls from eot_threshold_start: on the same horizon,
+            # the commit is always decided first and the eager stage never runs
+            raise ValueError(
+                f"eager_threshold ({self.eager_threshold}) on the commit's horizon must be "
+                f"below eot_threshold_start ({self.eot_threshold_start})"
+            )
+
+
+_DEFAULTS = STTV2Options()
 
 
 class STTV2(stt.STT):
@@ -120,18 +180,18 @@ class STTV2(stt.STT):
         keywords: list[str] | None = None,
         keyword_boost: float | None = None,
         log_level: LogLevel | None = None,
-        delay_in_frames: int | None = 7,
-        speech_threshold: float = 0.5,
-        silence_threshold: float = 0.35,
-        min_speech_duration: float = 0.15,
-        min_silence_duration: float = 0.1,
-        max_silence_duration: float = 2.5,
-        eot_horizon: float = 3.0,
-        eot_threshold_start: float = 0.5,
-        eot_threshold_end: float = 0.4,
-        eager_horizon: float = 2.0,
-        eager_threshold: float | None = None,
-        preflight_trigger: EagerPreflightTrigger | None = None,
+        delay_in_frames: int | None = _DEFAULTS.delay_in_frames,
+        speech_threshold: float = _DEFAULTS.speech_threshold,
+        silence_threshold: float = _DEFAULTS.silence_threshold,
+        min_speech_duration: float = _DEFAULTS.min_speech_duration,
+        min_silence_duration: float = _DEFAULTS.min_silence_duration,
+        max_silence_duration: float = _DEFAULTS.max_silence_duration,
+        eot_horizon: float = _DEFAULTS.eot_horizon,
+        eot_threshold_start: float = _DEFAULTS.eot_threshold_start,
+        eot_threshold_end: float = _DEFAULTS.eot_threshold_end,
+        eager_horizon: float = _DEFAULTS.eager_horizon,
+        eager_threshold: float | None = _DEFAULTS.eager_threshold,
+        preflight_trigger: EagerPreflightTrigger | None = _DEFAULTS.preflight_trigger,
     ) -> None:
         """Create a Gradium STT that ends turns from a local VAD and Gradium's semantic VAD.
 
@@ -217,47 +277,25 @@ class STTV2(stt.STT):
                 when the eager flush is answered, so it needs `eager_threshold`; None, the
                 default, never previews.
         """
-        if preflight_trigger is not None and preflight_trigger not in get_args(
-            EagerPreflightTrigger
-        ):
-            raise ValueError(
-                f"unknown preflight_trigger {preflight_trigger!r}, "
-                f"expected one of {get_args(EagerPreflightTrigger)} or None"
-            )
-        if delay_in_frames is not None and delay_in_frames not in DELAYS_IN_FRAMES:
-            raise ValueError(f"delay_in_frames must be one of {DELAYS_IN_FRAMES} or None")
-        for name, value in (
-            ("speech_threshold", speech_threshold),
-            ("silence_threshold", silence_threshold),
-            ("eot_threshold_start", eot_threshold_start),
-            ("eot_threshold_end", eot_threshold_end),
-        ):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be within [0, 1], got {value}")
-        if eager_threshold is not None and not 0.0 <= eager_threshold <= 1.0:
-            raise ValueError(f"eager_threshold must be within [0, 1], got {eager_threshold}")
-        if silence_threshold > speech_threshold:
-            raise ValueError("silence_threshold must not be above speech_threshold")
-        if min_speech_duration < 0:
-            raise ValueError("min_speech_duration must be >= 0")
-        if not 0.0 <= min_silence_duration < max_silence_duration:
-            raise ValueError("expected 0 <= min_silence_duration < max_silence_duration")
-        for name, horizon in (("eot_horizon", eot_horizon), ("eager_horizon", eager_horizon)):
-            if horizon <= 0:
-                raise ValueError(f"{name} must be a positive number of seconds, got {horizon}")
-        if preflight_trigger == "eager" and eager_threshold is None:
-            raise ValueError("preflight_trigger='eager' needs an eager_threshold")
-        if (
-            eager_threshold is not None
-            and eager_horizon == eot_horizon
-            and eager_threshold >= eot_threshold_start
-        ):
-            # the commit threshold only falls from eot_threshold_start: on the same horizon,
-            # the commit is always decided first and the eager stage never runs
-            raise ValueError(
-                f"eager_threshold ({eager_threshold}) on the commit's horizon must be below "
-                f"eot_threshold_start ({eot_threshold_start})"
-            )
+        opts = STTV2Options(
+            language=LanguageCode(language),
+            temperature=temperature,
+            keywords=list(keywords) if keywords is not None else None,
+            keyword_boost=keyword_boost,
+            log_level=log_level,
+            delay_in_frames=delay_in_frames,
+            speech_threshold=speech_threshold,
+            silence_threshold=silence_threshold,
+            min_speech_duration=min_speech_duration,
+            min_silence_duration=min_silence_duration,
+            max_silence_duration=max_silence_duration,
+            eot_horizon=eot_horizon,
+            eot_threshold_start=eot_threshold_start,
+            eot_threshold_end=eot_threshold_end,
+            eager_horizon=eager_horizon,
+            eager_threshold=eager_threshold,
+            preflight_trigger=preflight_trigger,
+        )
 
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -284,25 +322,7 @@ class STTV2(stt.STT):
         )
         self._model_name = model_name
         self._vad = vad
-        self._opts = STTV2Options(
-            language=LanguageCode(language),
-            temperature=temperature,
-            keywords=list(keywords) if keywords is not None else None,
-            keyword_boost=keyword_boost,
-            log_level=log_level,
-            delay_in_frames=delay_in_frames,
-            speech_threshold=speech_threshold,
-            silence_threshold=silence_threshold,
-            min_speech_duration=min_speech_duration,
-            min_silence_duration=min_silence_duration,
-            max_silence_duration=max_silence_duration,
-            eot_horizon=eot_horizon,
-            eot_threshold_start=eot_threshold_start,
-            eot_threshold_end=eot_threshold_end,
-            eager_horizon=eager_horizon,
-            eager_threshold=eager_threshold,
-            preflight_trigger=preflight_trigger,
-        )
+        self._opts = opts
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStreamV2]()
 
@@ -328,6 +348,36 @@ class STTV2(stt.STT):
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
         raise NotImplementedError("Gradium STT only supports streaming")
+
+    def update_options(
+        self,
+        *,
+        speech_threshold: NotGivenOr[float] = NOT_GIVEN,
+        silence_threshold: NotGivenOr[float] = NOT_GIVEN,
+        min_speech_duration: NotGivenOr[float] = NOT_GIVEN,
+        min_silence_duration: NotGivenOr[float] = NOT_GIVEN,
+        max_silence_duration: NotGivenOr[float] = NOT_GIVEN,
+        eot_horizon: NotGivenOr[float] = NOT_GIVEN,
+        eot_threshold_start: NotGivenOr[float] = NOT_GIVEN,
+        eot_threshold_end: NotGivenOr[float] = NOT_GIVEN,
+        eager_horizon: NotGivenOr[float] = NOT_GIVEN,
+        eager_threshold: NotGivenOr[float | None] = NOT_GIVEN,
+        preflight_trigger: NotGivenOr[EagerPreflightTrigger | None] = NOT_GIVEN,
+    ) -> None:
+        """Change how turns end, for new streams and the open ones from their next check.
+
+        For instance, give a user more time to think while an agent collects an address.
+        The arguments mean what they do in `__init__`. The update applies everywhere or,
+        if the result would be inconsistent, nowhere: it raises `ValueError`.
+        """
+        changes = {name: value for name, value in locals().items() if is_given(value)}
+        del changes["self"]
+        targets = [self._opts, *(stream._opts for stream in self._streams)]
+        for opts in targets:
+            dataclasses.replace(opts, **changes)  # validates before anything changes
+        for opts in targets:
+            for name, value in changes.items():
+                setattr(opts, name, value)
 
     def stream(
         self,
@@ -392,7 +442,7 @@ class _TurnTracker:
         self._opts = opts
         self._emit = emit
         self._request_flush = request_flush
-        self.word_lag_s = _DEFAULT_DELAY_IN_FRAMES * _FRAME_S + _WORD_LAG_S
+        self._delay_in_frames = opts.delay_in_frames or _DEFAULT_DELAY_IN_FRAMES
 
         # local VAD
         self._vad_t = 0.0
@@ -450,8 +500,14 @@ class _TurnTracker:
         self._speech_run = 0.0
         self._end_turn("audio_stalled")
 
+    @property
+    def word_lag_s(self) -> float:
+        """How long after it is spoken a word can still be on its way from Gradium."""
+        return self._delay_in_frames * _FRAME_S + _WORD_LAG_S
+
     def set_delay_in_frames(self, delay: int) -> None:
-        self.word_lag_s = delay * _FRAME_S + _WORD_LAG_S
+        """The model delay the server reports in `ready`."""
+        self._delay_in_frames = delay
 
     def on_vad(self, t: float, prob: float, *, wall: float) -> None:
         """A local VAD window ending at audio time `t`, processed at wall-clock `wall`."""

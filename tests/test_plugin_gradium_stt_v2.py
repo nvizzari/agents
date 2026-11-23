@@ -22,7 +22,7 @@ from livekit.agents import APIConnectOptions, APIError
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.agents.vad import VAD, VADCapabilities, VADEvent, VADEventType, VADStream
 from livekit.plugins.gradium import STTV2
-from livekit.plugins.gradium.stt_v2 import _TurnTracker
+from livekit.plugins.gradium.stt_v2 import STTV2Options, _TurnTracker
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time]
 
@@ -87,7 +87,7 @@ class _Timeline:
         self.flushes: list[int] = []
         self.t = 0.0
         self.tracker = _TurnTracker(
-            _stt(**overrides)._opts, emit=self.events.append, request_flush=self._flush
+            STTV2Options(**overrides), emit=self.events.append, request_flush=self._flush
         )
 
     def _flush(self) -> int:
@@ -385,6 +385,8 @@ def test_turn_opened_by_a_word_the_vad_missed_does_not_end_at_once():
         {"silence_threshold": 0.6, "speech_threshold": 0.5},
         {"min_silence_duration": 1.0, "max_silence_duration": 1.0},
         {"eot_horizon": 0.0},
+        # the commit threshold falls as the pause lasts
+        {"eot_threshold_start": 0.4, "eot_threshold_end": 0.6},
         {"eot_threshold_start": 1.5},
         {"delay_in_frames": 9},
         {"preflight_trigger": "vad_trip"},
@@ -482,8 +484,8 @@ class _Stream:
         self.session = _Session(self.sockets)
         self.vad = _ScriptedVAD()
         session: Any = self.session
-        stt = STTV2(vad=self.vad, api_key="test-key", http_session=session, **overrides)
-        self.stream = stt.stream(
+        self.stt = STTV2(vad=self.vad, api_key="test-key", http_session=session, **overrides)
+        self.stream = self.stt.stream(
             conn_options=APIConnectOptions(max_retry=max_retry, retry_interval=0.1, timeout=5)
         )
         self.events: list[SpeechEvent] = []
@@ -736,3 +738,24 @@ async def test_events_carry_gradium_request_id():
         s.ws.server({"type": "flushed", "flush_id": flush_id})
         await s.wait_for(SpeechEventType.END_OF_SPEECH)
         assert {e.request_id for e in s.events} == {"req-1"}
+
+
+async def test_update_options_applies_to_open_streams():
+    # An agent handing off to one that collects an address gives the user more time to
+    # think, mid-session: the open stream must follow from its next check.
+    async with _Stream() as s:
+        s.stt.update_options(eot_threshold_start=1.0, eot_threshold_end=1.0)
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.quiet(0.3)
+        s.ws.server(_step(0.7, 0.99))  # enough for the defaults, no longer enough
+        await asyncio.sleep(0.1)
+        assert s.ws.sent_of("flush") == []
+
+
+def test_inconsistent_update_changes_nothing():
+    # A rejected update must not leave some streams, or some fields, changed.
+    stt = _stt()
+    with pytest.raises(ValueError):
+        stt.update_options(eot_threshold_end=0.3, min_silence_duration=5.0)
+    assert stt._opts.eot_threshold_end == 0.4
