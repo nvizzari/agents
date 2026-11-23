@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What `STT` and `STTV2` share: Gradium's STT websocket protocol and the STT plumbing.
+"""What `STT` and `STTExperimental` share: Gradium's STT websocket protocol and the STT plumbing.
 
 Both classes speak the same protocol and differ only in how they end a turn, so the
 protocol lives here once: a fix to it applies to both.

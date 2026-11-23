@@ -16,7 +16,7 @@
 
 The local VAD (Silero) says *when* the user went quiet or started again; it runs on the
 audio as it arrives, with no network round trip and no model delay. Gradium's per-step
-inactivity probabilities say *whether* a pause ends the turn. `STTV2.__init__` documents
+inactivity probabilities say *whether* a pause ends the turn. `STTExperimental.__init__` documents
 the rules.
 
 Every time below is in seconds of audio since the stream started ("audio time"): the local
@@ -90,10 +90,10 @@ _VAD_BACKLOG_S = 0.1
 
 
 @dataclass
-class STTV2Options:
-    """`STTV2`'s options, with its defaults; an instance is always consistent.
+class STTExperimentalOptions:
+    """`STTExperimental`'s options, with its defaults; an instance is always consistent.
 
-    `STTV2.__init__` documents each field.
+    `STTExperimental.__init__` documents each field.
     """
 
     language: LanguageCode = LanguageCode("en")
@@ -167,10 +167,10 @@ class STTV2Options:
             )
 
 
-_DEFAULTS = STTV2Options()
+_DEFAULTS = STTExperimentalOptions()
 
 
-class STTV2(GradiumSTTBase):
+class STTExperimental(GradiumSTTBase):
     def __init__(
         self,
         *,
@@ -321,7 +321,7 @@ class STTV2(GradiumSTTBase):
                 default, never previews. Each preview the user then talks past costs a
                 cancelled LLM request.
         """
-        opts = STTV2Options(
+        opts = STTExperimentalOptions(
             language=LanguageCode(language),
             temperature=temperature,
             keywords=list(keywords) if keywords is not None else None,
@@ -349,7 +349,7 @@ class STTV2(GradiumSTTBase):
         )
         self._vad = vad
         self._opts = opts
-        self._streams = weakref.WeakSet[SpeechStreamV2]()
+        self._streams = weakref.WeakSet[SpeechStreamExperimental]()
 
     def update_options(
         self,
@@ -386,11 +386,11 @@ class STTV2(GradiumSTTBase):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> SpeechStreamV2:
+    ) -> SpeechStreamExperimental:
         opts = dataclasses.replace(self._opts)
         if is_given(language):
             opts.language = LanguageCode(language)
-        stream = SpeechStreamV2(
+        stream = SpeechStreamExperimental(
             stt=self,
             opts=opts,
             vad=self._vad,
@@ -436,7 +436,7 @@ class _TurnTracker:
 
     def __init__(
         self,
-        opts: STTV2Options,
+        opts: STTExperimentalOptions,
         *,
         emit: Callable[[stt.SpeechEvent], None],
         request_flush: Callable[[], int],
@@ -764,7 +764,7 @@ def _horizons(step: dict[str, Any]) -> dict[float, float]:
     return {float(v["horizon_s"]): float(v["inactivity_prob"]) for v in step.get("vad", [])}
 
 
-class SpeechStreamV2(stt.SpeechStream):
+class SpeechStreamExperimental(stt.SpeechStream):
     @dataclass
     class _TurnFlush(stt.SpeechStream._FlushSentinel):
         """A flush the end-of-turn logic asked for, behind the audio already queued."""
@@ -774,8 +774,8 @@ class SpeechStreamV2(stt.SpeechStream):
     def __init__(
         self,
         *,
-        stt: STTV2,
-        opts: STTV2Options,
+        stt: STTExperimental,
+        opts: STTExperimentalOptions,
         vad: agents_vad.VAD,
         conn_options: APIConnectOptions,
         api_key: str,

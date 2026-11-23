@@ -12,7 +12,7 @@
 
 from .log import logger
 from .stt import STT, PreflightTrigger, SpeechStream
-from .stt_v2 import STTV2, EagerPreflightTrigger, SpeechStreamV2
+from .stt_experimental import EagerPreflightTrigger, SpeechStreamExperimental, STTExperimental
 from .tts import TTS
 from .version import __version__
 
@@ -20,9 +20,9 @@ __all__ = [
     "EagerPreflightTrigger",
     "PreflightTrigger",
     "STT",
-    "STTV2",
+    "STTExperimental",
     "SpeechStream",
-    "SpeechStreamV2",
+    "SpeechStreamExperimental",
     "logger",
     "TTS",
     "__version__",

@@ -1,4 +1,4 @@
-"""Tests for the end of turn of Gradium's STTV2: a local VAD plus Gradium's semantic VAD.
+"""Tests for the end of turn of Gradium's STTExperimental: a local VAD plus Gradium's semantic VAD.
 
 Most tests drive `_TurnTracker`, the synchronous state machine, with a scripted timeline of
 local VAD windows and Gradium messages; the last ones go through the real stream with a
@@ -21,8 +21,8 @@ from livekit import rtc
 from livekit.agents import APIConnectOptions, APIError
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.agents.vad import VAD, VADCapabilities, VADEvent, VADEventType, VADStream
-from livekit.plugins.gradium import STTV2
-from livekit.plugins.gradium.stt_v2 import STTV2Options, _TurnTracker
+from livekit.plugins.gradium import STTExperimental
+from livekit.plugins.gradium.stt_experimental import STTExperimentalOptions, _TurnTracker
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time]
 
@@ -71,12 +71,12 @@ class _ScriptedVADStream(VADStream):
             )
 
 
-def _stt(**overrides: Any) -> STTV2:
-    return STTV2(vad=_ScriptedVAD(), api_key="test-key", **overrides)
+def _stt(**overrides: Any) -> STTExperimental:
+    return STTExperimental(vad=_ScriptedVAD(), api_key="test-key", **overrides)
 
 
 class _Timeline:
-    """A `_TurnTracker` with the defaults of `STTV2`, fed a scripted conversation.
+    """A `_TurnTracker` with the defaults of `STTExperimental`, fed a scripted conversation.
 
     `t` is the audio time; each helper advances it. Gradium steps come every 80 ms during
     `silence`, with the given probabilities.
@@ -87,7 +87,7 @@ class _Timeline:
         self.flushes: list[int] = []
         self.t = 0.0
         self.tracker = _TurnTracker(
-            STTV2Options(**overrides), emit=self.events.append, request_flush=self._flush
+            STTExperimentalOptions(**overrides), emit=self.events.append, request_flush=self._flush
         )
 
     def _flush(self) -> int:
@@ -466,7 +466,8 @@ def _step(
 
 
 class _Stream:
-    """A real `SpeechStreamV2` over scripted sockets (one per connection) and a scripted VAD.
+    """A real `SpeechStreamExperimental` over scripted sockets (one per connection) and a
+    scripted VAD.
 
     `ws` is the socket of the current connection; `speak` and `quiet` push real-time audio
     the VAD calls speech or silence.
@@ -484,7 +485,9 @@ class _Stream:
         self.session = _Session(self.sockets)
         self.vad = _ScriptedVAD()
         session: Any = self.session
-        self.stt = STTV2(vad=self.vad, api_key="test-key", http_session=session, **overrides)
+        self.stt = STTExperimental(
+            vad=self.vad, api_key="test-key", http_session=session, **overrides
+        )
         self.stream = self.stt.stream(
             conn_options=APIConnectOptions(max_retry=max_retry, retry_interval=0.1, timeout=5)
         )
