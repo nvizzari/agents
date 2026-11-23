@@ -77,6 +77,10 @@ _WORD_RESUME_MARGIN_S = 0.25
 # How long, beyond its model delay, Gradium takes to send a word: measured 1.0 s at delay
 # 7 and 1.2 s at delay 10 from the start of the word, at p50.
 _WORD_LAG_S = 0.6
+# How often the stream checks that audio still reaches the local VAD while a turn is open.
+_STALL_CHECK_S = 0.1
+# Audio pushed to the local VAD but not processed yet, beyond its window and resampling.
+_VAD_BACKLOG_S = 0.1
 
 
 @dataclass
@@ -408,6 +412,23 @@ class _TurnTracker:
             return self._flush_id
         return None
 
+    @property
+    def vad_time(self) -> tuple[float, float | None]:
+        """The audio time of the last local VAD window, and the wall-clock time it came."""
+        return self._vad_t, self._vad_wall
+
+    def on_audio_stalled(self) -> None:
+        """No audio has come for a while (track ended, muted): end the open turn.
+
+        Time only moves with the audio, so without this a turn whose audio stops would
+        never end.
+        """
+        if not self._turn_open:
+            return
+        self._speaking = False
+        self._speech_run = 0.0
+        self._end_turn()
+
     def set_delay_in_frames(self, delay: int) -> None:
         self.word_lag_s = delay * _FRAME_S + _WORD_LAG_S
 
@@ -688,6 +709,7 @@ class SpeechStreamV2(stt.SpeechStream):
         vad_stream = self._vad.stream()
         vad_task = asyncio.create_task(self._vad_task(vad_stream, offset))
         ws_task = asyncio.create_task(self._run_ws(vad_stream, offset))
+        watchdog = asyncio.create_task(self._stall_watchdog())
         try:
             done, _ = await asyncio.wait([vad_task, ws_task], return_when=asyncio.FIRST_COMPLETED)
             if ws_task not in done:
@@ -701,8 +723,23 @@ class SpeechStreamV2(stt.SpeechStream):
                 self._tracker.commit()
             raise
         finally:
-            await utils.aio.cancel_and_wait(ws_task, vad_task)
+            await utils.aio.cancel_and_wait(ws_task, vad_task, watchdog)
             await vad_stream.aclose()
+
+    async def _stall_watchdog(self) -> None:
+        """End the open turn once no audio has reached the local VAD for `max_silence`."""
+        tracker = self._tracker
+        while True:
+            await asyncio.sleep(_STALL_CHECK_S)
+            vad_t, vad_wall = tracker.vad_time
+            if not tracker.turn_open or vad_wall is None or self._input_ch.closed:
+                continue
+            if time.time() - vad_wall < self._opts.max_silence:
+                continue
+            if not self._input_ch.empty() or self._audio_pushed_s - vad_t > _VAD_BACKLOG_S:
+                continue  # the audio is late (backlog, reconnect), not missing
+            logger.debug("no audio for %.1fs, ending the turn", time.time() - vad_wall)
+            tracker.on_audio_stalled()
 
     async def _vad_task(self, vad_stream: agents_vad.VADStream, offset: float) -> None:
         async for ev in vad_stream:

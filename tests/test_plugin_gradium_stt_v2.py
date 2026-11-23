@@ -8,6 +8,7 @@ scripted VAD and websocket.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -402,25 +403,19 @@ class _QueueWebSocket:
 class _Session:
     """Hands out one scripted socket per connection."""
 
-    def __init__(self, *sockets: _QueueWebSocket) -> None:
-        self._sockets = list(sockets)
+    def __init__(self, sockets: list[_QueueWebSocket]) -> None:
+        self._sockets = sockets
         self.connects = 0
 
     async def ws_connect(self, url: str, **kwargs: Any) -> _QueueWebSocket:
         self.connects += 1
-        return self._sockets.pop(0)
+        return self._sockets[self.connects - 1]
 
 
 async def _until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
     async with asyncio.timeout(timeout):
         while not condition():
             await asyncio.sleep(0.01)
-
-
-async def _push(stream: Any, seconds: float) -> None:
-    for _ in range(round(seconds / 0.02)):
-        stream.push_frame(rtc.AudioFrame.create(SAMPLE_RATE, 1, SAMPLE_RATE // 50))
-        await asyncio.sleep(0.02)
 
 
 def _step(total_duration_s: float, prob: float) -> dict[str, Any]:
@@ -431,131 +426,157 @@ def _step(total_duration_s: float, prob: float) -> dict[str, Any]:
     }
 
 
-class _Collector:
-    def __init__(self, stream: Any) -> None:
-        self.events: list[SpeechEvent] = []
-        self._task = asyncio.create_task(self._collect(stream))
+class _Stream:
+    """A real `SpeechStreamV2` over scripted sockets (one per connection) and a scripted VAD.
 
-    async def _collect(self, stream: Any) -> None:
-        async for ev in stream:
-            self.events.append(ev)
+    `ws` is the socket of the current connection; `speak` and `quiet` push real-time audio
+    the VAD calls speech or silence.
+    """
+
+    def __init__(self, *, connections: int = 1, max_retry: int = 0, **overrides: Any) -> None:
+        self.sockets = [_QueueWebSocket() for _ in range(connections)]
+        self.session = _Session(self.sockets)
+        self.vad = _ScriptedVAD()
+        stt = STTV2(vad=self.vad, api_key="test-key", http_session=self.session, **overrides)  # type: ignore[arg-type]
+        self.stream = stt.stream(
+            conn_options=APIConnectOptions(max_retry=max_retry, retry_interval=0.1, timeout=5)
+        )
+        self.events: list[SpeechEvent] = []
+        self.error: BaseException | None = None
+        self._task = asyncio.create_task(self._collect())
+
+    async def __aenter__(self) -> _Stream:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        with contextlib.suppress(RuntimeError):  # the input may be closed already
+            self.stream.end_input()
+        await asyncio.wait_for(self._task, 5)
+        await self.stream.aclose()
+
+    async def _collect(self) -> None:
+        try:
+            async for ev in self.stream:
+                self.events.append(ev)
+        except APIStatusError as e:
+            self.error = e
+
+    @property
+    def ws(self) -> _QueueWebSocket:
+        return self.sockets[max(self.session.connects, 1) - 1]
+
+    async def speak(self, seconds: float) -> None:
+        await self._push(seconds, SPEECH)
+
+    async def quiet(self, seconds: float) -> None:
+        await self._push(seconds, SILENCE)
+
+    async def _push(self, seconds: float, prob: float) -> None:
+        self.vad.prob = prob
+        for _ in range(round(seconds / 0.02)):
+            self.stream.push_frame(rtc.AudioFrame.create(SAMPLE_RATE, 1, SAMPLE_RATE // 50))
+            await asyncio.sleep(0.02)
+
+    def word(self, text: str, stop_s: float) -> None:
+        """Gradium sends a word and its end, on the current connection's clock."""
+        self.ws.server({"type": "text", "text": text, "start_s": 0.0})
+        self.ws.server({"type": "end_text", "stop_s": stop_s})
+
+    async def flush_sent(self) -> int:
+        await _until(lambda: bool(self.ws.sent_of("flush")))
+        return int(self.ws.sent_of("flush")[-1]["flush_id"])
+
+    async def wait_for(self, type_: SpeechEventType) -> None:
+        await _until(lambda: type_ in self.types())
 
     def types(self) -> list[SpeechEventType]:
         return [e.type for e in self.events]
 
-    async def close(self, stream: Any) -> None:
-        stream.end_input()
-        await asyncio.wait_for(self._task, 5)
-        await stream.aclose()
+    def finals(self) -> list[SpeechEvent]:
+        return [e for e in self.events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+
+    def final_texts(self) -> list[str]:
+        return [e.alternatives[0].text for e in self.finals()]
 
 
 async def test_stream_feeds_the_vad_and_ends_the_turn_on_gradium_flush_reply():
     # End to end through the stream: the audio reaches the local VAD, its silence plus
     # Gradium's step makes the stream send a flush, and the final comes on the reply.
-    ws = _QueueWebSocket()
-    vad = _ScriptedVAD()
-    stt = STTV2(vad=vad, api_key="test-key", http_session=_Session(ws))  # type: ignore[arg-type]
-    stream = stt.stream(conn_options=APIConnectOptions(max_retry=0, timeout=5))
-    collector = _Collector(stream)
-    events = collector.events
-    try:
-        vad.prob = SPEECH
-        await _push(stream, 0.4)
-        ws.server({"type": "text", "text": "hello", "start_s": 0.0})
-        ws.server({"type": "end_text", "stop_s": 0.4})
-        vad.prob = SILENCE
-        await _push(stream, 0.3)
-        ws.server(_step(0.7, 0.99))
-        await _until(lambda: bool(ws.sent_of("flush")))
-        assert SpeechEventType.FINAL_TRANSCRIPT not in [e.type for e in events]
+    async with _Stream() as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.quiet(0.3)
+        s.ws.server(_step(0.7, 0.99))
+        flush_id = await s.flush_sent()
+        assert s.finals() == []
 
-        ws.server({"type": "flushed", "flush_id": ws.sent_of("flush")[0]["flush_id"]})
-        await _until(lambda: SpeechEventType.END_OF_SPEECH in [e.type for e in events])
-        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
-        assert [e.alternatives[0].text for e in finals] == ["hello"]
-        assert ws.sent[0]["json_config"]["delay_in_frames"] == 7
-    finally:
-        await collector.close(stream)
+        s.ws.server({"type": "flushed", "flush_id": flush_id})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["hello"]
+
+
+async def test_setup_asks_for_the_configured_model_delay():
+    # The model delay sets how late words arrive, and so the latency of every turn.
+    async with _Stream(delay_in_frames=10) as s:
+        await _until(lambda: bool(s.ws.sent))
+        assert s.ws.sent[0]["json_config"]["delay_in_frames"] == 10
 
 
 async def test_after_a_reconnect_gradium_and_the_vad_stay_on_the_stream_clock():
     # A reconnect restarts Gradium's clock and the local VAD stream at 0. Both must be
     # re-anchored to the audio already consumed, or the pause of the open turn is measured
     # against the wrong times and never ends on the new connection's steps.
-    ws1, ws2 = _QueueWebSocket(), _QueueWebSocket()
-    vad = _ScriptedVAD()
-    session = _Session(ws1, ws2)
-    stt = STTV2(vad=vad, api_key="test-key", http_session=session, max_silence=5.0)  # type: ignore[arg-type]
-    stream = stt.stream(conn_options=APIConnectOptions(max_retry=1, retry_interval=0.1, timeout=5))
-    collector = _Collector(stream)
-    try:
-        vad.prob = SPEECH
-        await _push(stream, 0.4)
-        ws1.server({"type": "text", "text": "hello", "start_s": 0.0})
-        ws1.server({"type": "end_text", "stop_s": 0.4})
-        await _until(lambda: SpeechEventType.INTERIM_TRANSCRIPT in collector.types())
-        ws1.server_close()
-        await _until(lambda: session.connects == 2)
+    async with _Stream(connections=2, max_retry=1, max_silence=5.0) as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
+        s.ws.server_close()
+        await _until(lambda: s.session.connects == 2)
 
-        vad.prob = SILENCE
-        await _push(stream, 0.3)
-        ws2.server(_step(0.3, 0.99))  # 0.3 s into the new connection: 0.7 s of audio
-        await _until(lambda: bool(ws2.sent_of("flush")))
-        ws2.server({"type": "flushed", "flush_id": ws2.sent_of("flush")[0]["flush_id"]})
-        await _until(lambda: SpeechEventType.END_OF_SPEECH in collector.types())
+        await s.quiet(0.3)
+        s.ws.server(_step(0.3, 0.99))  # 0.3 s into the new connection: 0.7 s of audio
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
         # the word ended 0.4 s into the stream, on the first connection's clock
-        final = next(e for e in collector.events if e.type == SpeechEventType.FINAL_TRANSCRIPT)
-        assert final.alternatives[0].end_time == pytest.approx(0.4, abs=0.05)
-    finally:
-        await collector.close(stream)
+        assert s.finals()[0].alternatives[0].end_time == pytest.approx(0.4, abs=0.05)
 
 
 async def test_transient_server_error_does_not_end_the_turn():
     # The stream reconnects after a retryable error while the user may still be talking:
     # ending the turn there would make the agent answer half a sentence.
-    ws1, ws2 = _QueueWebSocket(), _QueueWebSocket()
-    vad = _ScriptedVAD()
-    stt = STTV2(vad=vad, api_key="test-key", http_session=_Session(ws1, ws2))  # type: ignore[arg-type]
-    stream = stt.stream(conn_options=APIConnectOptions(max_retry=1, retry_interval=0.1, timeout=5))
-    collector = _Collector(stream)
-    try:
-        vad.prob = SPEECH
-        await _push(stream, 0.4)
-        ws1.server({"type": "text", "text": "I", "start_s": 0.0})
-        ws1.server({"type": "end_text", "stop_s": 0.4})
-        await _until(lambda: SpeechEventType.INTERIM_TRANSCRIPT in collector.types())
-        ws1.server({"type": "error", "message": "worker failure", "code": 1011})
-        await _push(stream, 0.3)
-        ws2.server({"type": "text", "text": "want", "start_s": 0.0})
-        ws2.server({"type": "end_text", "stop_s": 0.3})
-        vad.prob = SILENCE
-        await _push(stream, 0.3)
-        ws2.server(_step(0.6, 0.99))
-        await _until(lambda: bool(ws2.sent_of("flush")))
-        ws2.server({"type": "flushed", "flush_id": ws2.sent_of("flush")[0]["flush_id"]})
-        await _until(lambda: SpeechEventType.END_OF_SPEECH in collector.types())
-        finals = [e for e in collector.events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
-        assert [e.alternatives[0].text for e in finals] == ["I want"]
-    finally:
-        await collector.close(stream)
+    async with _Stream(connections=2, max_retry=1) as s:
+        await s.speak(0.4)
+        s.word("I", stop_s=0.4)
+        await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
+        s.ws.server({"type": "error", "message": "worker failure", "code": 1011})
+        await s.speak(0.3)
+        s.word("want", stop_s=0.3)
+        await s.quiet(0.3)
+        s.ws.server(_step(0.6, 0.99))
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["I want"]
 
 
 async def test_words_are_final_when_the_stream_gives_up():
     # When no retry is left, the words already transcribed are all the user will get:
     # they must still reach the session as a final.
-    ws = _QueueWebSocket()
-    vad = _ScriptedVAD()
-    stt = STTV2(vad=vad, api_key="test-key", http_session=_Session(ws))  # type: ignore[arg-type]
-    stream = stt.stream(conn_options=APIConnectOptions(max_retry=0, timeout=5))
-    events: list[SpeechEvent] = []
-    vad.prob = SPEECH
-    await _push(stream, 0.4)
-    ws.server({"type": "text", "text": "hello", "start_s": 0.0})
-    ws.server({"type": "error", "message": "worker failure", "code": 1011})
-    with pytest.raises(APIStatusError):
-        async with asyncio.timeout(5):
-            async for ev in stream:
-                events.append(ev)
-    finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
-    assert [e.alternatives[0].text for e in finals] == ["hello"]
-    await stream.aclose()
+    async with _Stream() as s:
+        await s.speak(0.4)
+        s.ws.server({"type": "text", "text": "hello", "start_s": 0.0})
+        s.ws.server({"type": "error", "message": "worker failure", "code": 1011})
+        await _until(lambda: s.error is not None)
+        assert s.final_texts() == ["hello"]
+
+
+async def test_turn_ends_when_the_audio_stops():
+    # A track that ends or a muted microphone stops the audio mid-turn; time only moves
+    # with the audio, so without a watchdog the turn would stay open forever.
+    async with _Stream(max_silence=1.0) as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
+        # no more audio
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["hello"]
