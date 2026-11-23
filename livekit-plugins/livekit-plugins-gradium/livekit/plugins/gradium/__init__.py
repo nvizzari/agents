@@ -12,13 +12,17 @@
 
 from .log import logger
 from .stt import STT, PreflightTrigger, SpeechStream
+from .stt_v2 import STTV2, EagerPreflightTrigger, SpeechStreamV2
 from .tts import TTS
 from .version import __version__
 
 __all__ = [
+    "EagerPreflightTrigger",
     "PreflightTrigger",
     "STT",
+    "STTV2",
     "SpeechStream",
+    "SpeechStreamV2",
     "logger",
     "TTS",
     "__version__",

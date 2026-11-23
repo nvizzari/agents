@@ -1,0 +1,843 @@
+# Copyright 2023 LiveKit, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Gradium STT whose end of turn combines a local VAD with Gradium's semantic VAD.
+
+The local VAD (Silero) says *when* the user went quiet or started again; it runs on the
+audio as it arrives, with no network round trip and no model delay. Gradium's per-step
+inactivity probabilities say *whether* a pause ends the turn. The turn ends once the pause
+has lasted `min_silence` and Gradium's probability is above a threshold that falls the
+longer the pause lasts, or once it has lasted `max_silence`.
+
+Every time below is in seconds of audio since the stream started ("audio time"): the local
+VAD reports the audio it processed, and a Gradium `step` describes the audio up to its
+`total_duration_s` (measured: after the user resumes, the buckets react within one or two
+steps whatever the model delay), so both line up without correction.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import dataclasses
+import json
+import os
+import time
+import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Literal, TypeAlias, get_args
+
+import aiohttp
+
+from livekit import rtc
+from livekit.agents import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    APIConnectOptions,
+    APIStatusError,
+    LanguageCode,
+    stt,
+    utils,
+    vad as agents_vad,
+)
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.utils import AudioBuffer, is_given
+
+from .api import ws_headers
+from .log import log_server_message, logger
+from .models import LogLevel
+from .stt import SUPPORTED_SAMPLE_RATE, _api_error
+
+EagerPreflightTrigger: TypeAlias = Literal["eager"]
+
+DELAYS_IN_FRAMES = (7, 8, 10, 12, 14, 16, 20, 24, 36, 48)
+"""The `delay_in_frames` values Gradium accepts."""
+NUM_BUCKETS = 4
+"""Gradium sends one inactivity probability per horizon: 0.5, 1, 2 and 3 s."""
+_FRAME_S = 0.08
+_DEFAULT_DELAY_IN_FRAMES = 10
+# A word that ends this long after the local VAD placed the start of a pause was spoken
+# during that pause: the local VAD missed it, and the user is talking again. A word's
+# `stop_s` lands within ~0.05 s of its real end and the VAD places a pause up to ~0.1 s
+# late, so the words that end the turn stay well inside this margin.
+_WORD_RESUME_MARGIN_S = 0.25
+# How long, beyond its model delay, Gradium takes to send a word: measured 1.0 s at delay
+# 7 and 1.2 s at delay 10 from the start of the word, at p50.
+_WORD_LAG_S = 0.6
+
+
+@dataclass
+class STTV2Options:
+    language: LanguageCode
+    temperature: float | None
+    keywords: list[str] | None
+    keyword_boost: float | None
+    log_level: LogLevel | None
+    delay_in_frames: int | None
+    speech_threshold: float
+    silence_threshold: float
+    min_speech_duration: float
+    min_silence: float
+    max_silence: float
+    eot_bucket: int
+    eot_threshold_start: float
+    eot_threshold_end: float
+    eager_bucket: int
+    eager_threshold: float | None
+    preflight_trigger: EagerPreflightTrigger | None
+
+
+class STTV2(stt.STT):
+    def __init__(
+        self,
+        *,
+        vad: agents_vad.VAD,
+        api_key: str | None = None,
+        model_endpoint: str | None = None,
+        model_name: str = "default",
+        http_session: aiohttp.ClientSession | None = None,
+        language: str = "en",
+        temperature: float | None = None,
+        keywords: list[str] | None = None,
+        keyword_boost: float | None = None,
+        log_level: LogLevel | None = None,
+        delay_in_frames: int | None = 7,
+        speech_threshold: float = 0.5,
+        silence_threshold: float = 0.35,
+        min_speech_duration: float = 0.15,
+        min_silence: float = 0.1,
+        max_silence: float = 2.5,
+        eot_bucket: int = 3,
+        eot_threshold_start: float = 0.5,
+        eot_threshold_end: float = 0.4,
+        eager_bucket: int = 2,
+        eager_threshold: float | None = None,
+        preflight_trigger: EagerPreflightTrigger | None = "eager",
+    ) -> None:
+        """Create a Gradium STT that ends turns from a local VAD and Gradium's semantic VAD.
+
+        Use it with `AgentSession(turn_detection="stt", ...)`: the STT owns the end of turn.
+
+        How a turn ends:
+
+        1. The local `vad` hears speech for `min_speech_duration`: the turn starts.
+        2. Its speech probability falls below `silence_threshold`: a pause starts. It ends
+           when the probability stays above `speech_threshold` for `min_speech_duration`
+           again, or when Gradium sends a word that ended during the pause.
+        3. Once the pause has lasted `min_silence`, each Gradium step is checked:
+           - Eager: when the `eager_bucket` probability reaches `eager_threshold`, the STT
+             flushes, which makes Gradium send the words its model delay still holds, and
+             previews them as a `PREFLIGHT_TRANSCRIPT` so the session can start the LLM.
+           - Commit: when the `eot_bucket` probability reaches a threshold that falls from
+             `eot_threshold_start` (at `min_silence`) to `eot_threshold_end` (at
+             `max_silence`), the turn ends: `FINAL_TRANSCRIPT` then `END_OF_SPEECH`, as
+             soon as the flush is answered.
+        4. After `max_silence` of pause the turn ends whatever Gradium says.
+
+        If the user starts again before the commit, the pending end is dropped, and a stale
+        preview is superseded by an `INTERIM_TRANSCRIPT` so the session drops its early
+        LLM request.
+
+        Parameter sets that work together, with the other options at their defaults. They
+        were measured live against Gradium (delay 7, Silero) on 45 synthetic clips of one to
+        three sentences, 18 of them with a scripted mid-sentence pause of 0.6 s or 1.5 s.
+        Times are seconds after the user stopped, p50 / p90; every premature end was in a
+        1.5 s pause:
+
+        - Responsive: `min_silence=0.1, max_silence=2.0, eot_threshold_start=0.4,
+          eot_threshold_end=0.4`. Final 0.78 / 0.98; 12 premature ends in 90 runs.
+        - Balanced, the defaults: `min_silence=0.1, max_silence=2.5,
+          eot_threshold_start=0.5, eot_threshold_end=0.4`. Final 0.81 / 1.09; 6 premature
+          ends in 90 runs.
+        - Patient, speculative: `min_silence=0.3, max_silence=3.0, eot_threshold_start=0.95,
+          eot_threshold_end=0.6, eager_bucket=2, eager_threshold=0.5`. Final 1.21 / 1.55,
+          but the preview starts the LLM at 0.84 / 1.10; 1 premature end in 45 runs. Costs
+          the LLM requests of the previews (52 in those 45 runs). Without the eager preview the same
+          thresholds give a final at 1.56 / 2.07.
+
+        For comparison, `STT` with its defaults: final 1.97 / 2.38, no premature end.
+
+        Args:
+            vad: The local VAD, such as `silero.VAD.load()`. Only its per-window speech
+                probability is used; its own speech and silence durations are ignored.
+                The STT runs its own stream of it, besides the session's.
+            delay_in_frames: Gradium's model delay, in 80 ms frames: one of 7, 8, 10, 12,
+                14, 16, 20, 24, 36, 48. Lower sends words sooner, and so makes the flush
+                and the final transcript faster; higher can transcribe more accurately.
+                None uses the server's default (10).
+            speech_threshold: Local VAD probability at or above which a window is speech.
+            silence_threshold: Local VAD probability below which a window is silence.
+                Between the two, the VAD keeps its state: the gap is the hysteresis that
+                stops a probability hovering around one threshold from flapping.
+            min_speech_duration: Seconds of continuous speech that start a turn, or end a
+                pause. Higher ignores coughs and clicks, but reacts later to the user
+                starting again.
+            min_silence: Seconds of pause before the turn may end. The floor of the
+                latency.
+            max_silence: Seconds of pause after which the turn ends whatever Gradium says.
+                The ceiling of the latency.
+            eot_bucket: Which Gradium horizon decides the end of turn: 0, 1, 2 or 3 for
+                0.5, 1, 2 or 3 s. A longer horizon asks "will the user stay quiet for
+                that long", so it is slower to rise and cuts fewer mid-sentence pauses.
+            eot_threshold_start: `eot_bucket` probability that ends the turn at
+                `min_silence`. Raise it to cut fewer pauses, lower it to end sooner.
+            eot_threshold_end: `eot_bucket` probability that ends the turn at
+                `max_silence`; the threshold falls in a straight line in between.
+            eager_bucket: Which Gradium horizon triggers the eager flush and preview.
+            eager_threshold: `eager_bucket` probability that triggers them, once the pause
+                lasted `min_silence`. None flushes only at the commit, so the final comes
+                one flush round trip (about 0.25 s) after the decision; the local VAD can
+                still cancel the commit during that time if the user starts again, which
+                measurably avoids premature turns. An eager flush answered before the
+                decision gives up that window: pair it with a stricter commit threshold.
+            preflight_trigger: `"eager"` previews the words as a `PREFLIGHT_TRANSCRIPT`
+                when the eager flush is answered; None never previews.
+        """
+        if preflight_trigger is not None and preflight_trigger not in get_args(
+            EagerPreflightTrigger
+        ):
+            raise ValueError(
+                f"unknown preflight_trigger {preflight_trigger!r}, "
+                f"expected one of {get_args(EagerPreflightTrigger)} or None"
+            )
+        if delay_in_frames is not None and delay_in_frames not in DELAYS_IN_FRAMES:
+            raise ValueError(f"delay_in_frames must be one of {DELAYS_IN_FRAMES} or None")
+        for name, value in (
+            ("speech_threshold", speech_threshold),
+            ("silence_threshold", silence_threshold),
+            ("eot_threshold_start", eot_threshold_start),
+            ("eot_threshold_end", eot_threshold_end),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1], got {value}")
+        if eager_threshold is not None and not 0.0 <= eager_threshold <= 1.0:
+            raise ValueError(f"eager_threshold must be within [0, 1], got {eager_threshold}")
+        if silence_threshold > speech_threshold:
+            raise ValueError("silence_threshold must not be above speech_threshold")
+        if min_speech_duration < 0:
+            raise ValueError("min_speech_duration must be >= 0")
+        if not 0.0 <= min_silence < max_silence:
+            raise ValueError("expected 0 <= min_silence < max_silence")
+        for name, bucket in (("eot_bucket", eot_bucket), ("eager_bucket", eager_bucket)):
+            if not 0 <= bucket < NUM_BUCKETS:
+                raise ValueError(f"{name} must be within [0, {NUM_BUCKETS - 1}], got {bucket}")
+
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=True,
+                interim_results=True,
+                aligned_transcript=False,
+                offline_recognize=False,
+                manual_flush=True,
+            ),
+        )
+
+        api_key = api_key or os.environ.get("GRADIUM_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Gradium API key is required. "
+                "Pass one in via the `api_key` parameter, "
+                "or set it as the `GRADIUM_API_KEY` environment variable"
+            )
+        self._api_key = api_key
+        self._model_endpoint = (
+            model_endpoint
+            or os.environ.get("GRADIUM_MODEL_ENDPOINT")
+            or "wss://api.gradium.ai/api/speech/asr"
+        )
+        self._model_name = model_name
+        self._vad = vad
+        self._opts = STTV2Options(
+            language=LanguageCode(language),
+            temperature=temperature,
+            keywords=list(keywords) if keywords is not None else None,
+            keyword_boost=keyword_boost,
+            log_level=log_level,
+            delay_in_frames=delay_in_frames,
+            speech_threshold=speech_threshold,
+            silence_threshold=silence_threshold,
+            min_speech_duration=min_speech_duration,
+            min_silence=min_silence,
+            max_silence=max_silence,
+            eot_bucket=eot_bucket,
+            eot_threshold_start=eot_threshold_start,
+            eot_threshold_end=eot_threshold_end,
+            eager_bucket=eager_bucket,
+            eager_threshold=eager_threshold,
+            preflight_trigger=preflight_trigger,
+        )
+        self._session = http_session
+        self._streams = weakref.WeakSet[SpeechStreamV2]()
+
+    @property
+    def model(self) -> str:
+        return self._model_name
+
+    @property
+    def provider(self) -> str:
+        return "Gradium"
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if not self._session:
+            self._session = utils.http_context.http_session()
+        return self._session
+
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions,
+    ) -> stt.SpeechEvent:
+        raise NotImplementedError("Gradium STT only supports streaming")
+
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SpeechStreamV2:
+        opts = dataclasses.replace(self._opts)
+        if is_given(language):
+            opts.language = LanguageCode(language)
+        stream = SpeechStreamV2(
+            stt=self,
+            opts=opts,
+            vad=self._vad,
+            conn_options=conn_options,
+            api_key=self._api_key,
+            model_endpoint=self._model_endpoint,
+            model_name=self._model_name,
+            http_session=self.session,
+        )
+        self._streams.add(stream)
+        return stream
+
+
+class _TurnTracker:
+    """The end-of-turn state machine; synchronous and free of I/O, so it can be replayed.
+
+    Feed it the local VAD's windows (`on_vad`) and Gradium's messages (`on_step`,
+    `on_text`, `on_end_text`, `on_flushed`), all in audio time. It emits speech events
+    through `emit` and asks for a flush through `request_flush`, which returns the id the
+    matching `flushed` will carry.
+    """
+
+    def __init__(
+        self,
+        opts: STTV2Options,
+        *,
+        emit: Callable[[stt.SpeechEvent], None],
+        request_flush: Callable[[], int],
+        start_time_offset: Callable[[], float] = lambda: 0.0,
+    ) -> None:
+        self._opts = opts
+        self._emit = emit
+        self._request_flush = request_flush
+        self._start_time_offset = start_time_offset
+        self.word_lag_s = _DEFAULT_DELAY_IN_FRAMES * _FRAME_S + _WORD_LAG_S
+
+        # local VAD
+        self._vad_t = 0.0
+        self._vad_wall: float | None = None
+        self._speech_run = 0.0
+        self._speaking = False
+        # latest audio time known to hold speech: the last speech window of the local VAD,
+        # or the end of the last word; a pause is measured from it
+        self._speech_seen_t = 0.0
+
+        # Gradium's latest step
+        self._probs: list[float] | None = None
+        self._probs_t = 0.0
+
+        # the turn
+        self._turn_open = False
+        self._words: list[str] = []
+        self._last_word_t = 0.0  # end of the last word, or the start of the turn
+        self._speech_end_t: float | None = None  # end of the last word, when Gradium sent it
+        self._flush_id: int | None = None
+        self._flush_answered = False
+        self._commit_pending = False
+        self._preflight_text = ""
+
+    @property
+    def turn_open(self) -> bool:
+        return self._turn_open
+
+    @property
+    def pending_flush(self) -> int | None:
+        """The id of the flush sent for this pause and not answered yet."""
+        return None if self._flush_answered else self._flush_id
+
+    def set_delay_in_frames(self, delay: int) -> None:
+        self.word_lag_s = delay * _FRAME_S + _WORD_LAG_S
+
+    def on_vad(self, t: float, prob: float, *, wall: float) -> None:
+        """A local VAD window ending at audio time `t`, processed at wall-clock `wall`."""
+        dt = max(t - self._vad_t, 0.0)
+        self._vad_t, self._vad_wall = t, wall
+        if prob >= self._opts.speech_threshold:
+            self._speech_run += dt
+        elif prob < self._opts.silence_threshold:
+            self._speech_run = 0.0
+
+        if self._speaking:
+            if prob < self._opts.silence_threshold:
+                self._speaking = False
+            else:
+                self._speech_seen_t = t
+        elif self._speech_run >= self._opts.min_speech_duration and self._speech_run > 0:
+            self._speaking = True
+            self._speech_seen_t = t
+            self._on_speech(onset=t - self._speech_run)
+        self._evaluate()
+
+    def on_step(self, t: float, probs: list[float]) -> None:
+        """A Gradium step: inactivity probabilities for the audio up to `t`."""
+        self._probs, self._probs_t = probs, t
+        self._evaluate()
+
+    def on_text(self, text: str) -> None:
+        if not self._turn_open:
+            self._open_turn(onset=None)
+            # the local VAD missed this speech; until the word's end arrives, its arrival
+            # is the only evidence of when it was spoken
+            self._speech_seen_t = max(self._speech_seen_t, self._vad_t)
+        elif self._flush_answered:
+            # the flush returned every word the model held when it was sent: a word after
+            # its reply was spoken after the pause started
+            self._resume()
+        self._words.append(text)
+        self._emit_text(stt.SpeechEventType.INTERIM_TRANSCRIPT, " ".join(self._words))
+
+    def on_end_text(self, stop_s: float) -> None:
+        """The end, in audio time, of the word Gradium sent last."""
+        self._speech_end_t = stop_s
+        self._last_word_t = max(self._last_word_t, stop_s)
+        if stop_s <= self._speech_seen_t:
+            return
+        if self._turn_open and not self._speaking:
+            if stop_s > self._speech_seen_t + _WORD_RESUME_MARGIN_S:
+                self._resume()
+        self._speech_seen_t = stop_s
+
+    def on_flushed(self, flush_id: int) -> None:
+        if flush_id != self._flush_id or self._flush_answered:
+            return  # the flush of a pause the user has since ended
+        self._flush_answered = True
+        self._evaluate()
+        if self._turn_open and self._opts.preflight_trigger == "eager":
+            text = " ".join(self._words)
+            if text and text != self._preflight_text:
+                self._preflight_text = text
+                self._emit_text(stt.SpeechEventType.PREFLIGHT_TRANSCRIPT, text)
+
+    def on_flush_lost(self) -> None:
+        """The pending flush will never be answered (reconnect): send a new one if needed."""
+        self._flush_id = None
+        self._flush_answered = False
+        self._evaluate()
+
+    def commit(self) -> None:
+        """End the open turn now with the words received so far."""
+        if not self._turn_open:
+            return
+        text = " ".join(self._words)
+        offset = self._start_time_offset()
+        end_t = self._speech_end_t
+        alternatives = [
+            stt.SpeechData(
+                text=text,
+                language=self._opts.language,
+                end_time=end_t + offset if end_t is not None else 0.0,
+            )
+        ]
+        self._emit(
+            stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=alternatives)
+        )
+        self._emit(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.END_OF_SPEECH,
+                alternatives=alternatives if end_t is not None else [],
+                speech_end_time=self._wall_of(self._speech_seen_t),
+            )
+        )
+        self._turn_open = False
+        self._words = []
+        self._speech_end_t = None
+        self._reset_pause()
+
+    def _open_turn(self, onset: float | None) -> None:
+        self._turn_open = True
+        self._last_word_t = onset if onset is not None else self._vad_t
+        self._reset_pause()
+        self._emit(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.START_OF_SPEECH,
+                speech_start_time=self._wall_of(onset) if onset is not None else None,
+            )
+        )
+
+    def _on_speech(self, onset: float) -> None:
+        if not self._turn_open:
+            self._open_turn(onset)
+        else:
+            self._resume()
+
+    def _resume(self) -> None:
+        """The user is talking again: the pause did not end the turn."""
+        stale_preview = bool(self._preflight_text)
+        self._reset_pause()
+        if stale_preview and self._words:
+            # an interim after a preview is how the session learns the preview is stale
+            self._emit_text(stt.SpeechEventType.INTERIM_TRANSCRIPT, " ".join(self._words))
+
+    def _reset_pause(self) -> None:
+        self._flush_id = None
+        self._flush_answered = False
+        self._commit_pending = False
+        self._preflight_text = ""
+
+    def _eot_threshold(self, silence: float) -> float:
+        o = self._opts
+        frac = (silence - o.min_silence) / (o.max_silence - o.min_silence)
+        frac = min(max(frac, 0.0), 1.0)
+        return o.eot_threshold_start + (o.eot_threshold_end - o.eot_threshold_start) * frac
+
+    def _evaluate(self) -> None:
+        if not self._turn_open:
+            return
+        o = self._opts
+        now = max(self._vad_t, self._probs_t)
+        if self._speaking:
+            # The local VAD hears speech but Gradium has transcribed nothing for far longer
+            # than its delay: background noise, which would otherwise hold the turn open.
+            if now - self._last_word_t >= o.max_silence + self.word_lag_s:
+                self._commit_pending = True
+                self._advance_commit()
+            return
+
+        silence = now - self._speech_seen_t
+        if not self._commit_pending:
+            if silence < o.min_silence:
+                return
+            # a step from before the pause still describes speech
+            probs = self._probs if self._probs_t >= self._speech_seen_t else None
+            if silence >= o.max_silence or (
+                probs is not None and probs[o.eot_bucket] >= self._eot_threshold(silence)
+            ):
+                self._commit_pending = True
+            elif (
+                probs is not None
+                and o.eager_threshold is not None
+                and self._flush_id is None
+                and probs[o.eager_bucket] >= o.eager_threshold
+            ):
+                self._flush_id = self._request_flush()
+                return
+        if self._commit_pending:
+            self._advance_commit()
+
+    def _advance_commit(self) -> None:
+        if self._flush_id is None:
+            self._flush_id = self._request_flush()
+        elif self._flush_answered:
+            self.commit()
+
+    def _emit_text(self, type_: stt.SpeechEventType, text: str) -> None:
+        self._emit(
+            stt.SpeechEvent(
+                type=type_,
+                alternatives=[stt.SpeechData(text=text, language=self._opts.language)],
+            )
+        )
+
+    def _wall_of(self, t: float) -> float | None:
+        if self._vad_wall is None:
+            return None
+        return self._vad_wall - (self._vad_t - t)
+
+
+class SpeechStreamV2(stt.SpeechStream):
+    @dataclass
+    class _TurnFlush(stt.SpeechStream._FlushSentinel):
+        """A flush the end-of-turn logic asked for, behind the audio already queued."""
+
+        flush_id: int
+
+    def __init__(
+        self,
+        *,
+        stt: STTV2,
+        opts: STTV2Options,
+        vad: agents_vad.VAD,
+        conn_options: APIConnectOptions,
+        api_key: str,
+        model_endpoint: str,
+        model_name: str,
+        http_session: aiohttp.ClientSession,
+    ) -> None:
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=SUPPORTED_SAMPLE_RATE)
+        self._opts = opts
+        self._vad = vad
+        self._api_key = api_key
+        self._model_endpoint = model_endpoint
+        self._model_name = model_name
+        self._session = http_session
+        # ids are never reused, so a reply from an earlier connection cannot match
+        self._flush_count = 0
+        # seconds of audio taken from the input over every connection so far
+        self._audio_pushed_s = 0.0
+        # when to stop waiting for the reply to each pending flush, in event-loop time
+        self._flush_deadlines: dict[int, float] = {}
+        self._tracker = _TurnTracker(
+            opts,
+            emit=self._event_ch.send_nowait,
+            request_flush=self._request_turn_flush,
+            start_time_offset=lambda: self.start_time_offset,
+        )
+
+    def _request_turn_flush(self) -> int:
+        self._flush_count += 1
+        flush_id = self._flush_count
+        if self._input_ch.closed:
+            # no flush can follow end_of_stream: the server's own end_of_stream ends the turn
+            return flush_id
+        self._flush_deadlines[flush_id] = (
+            asyncio.get_running_loop().time() + self._conn_options.timeout
+        )
+        self._input_ch.send_nowait(self._TurnFlush(flush_id))
+        return flush_id
+
+    async def _run(self) -> None:
+        # the base class calls _run again after a retryable error: a new connection and a
+        # new local VAD stream, both starting at the audio consumed so far
+        offset = self._audio_pushed_s
+        if self._tracker.pending_flush is not None:
+            # its reply was due on the connection that failed
+            self._flush_deadlines.clear()
+            self._tracker.on_flush_lost()
+        vad_stream = self._vad.stream()
+        vad_task = asyncio.create_task(self._vad_task(vad_stream, offset))
+        ws_task = asyncio.create_task(self._run_ws(vad_stream, offset))
+        try:
+            done, _ = await asyncio.wait([vad_task, ws_task], return_when=asyncio.FIRST_COMPLETED)
+            if ws_task not in done:
+                vad_task.result()  # raises the VAD's error
+                raise RuntimeError("the local VAD stream ended before the input")
+            ws_task.result()
+        finally:
+            await utils.aio.cancel_and_wait(ws_task, vad_task)
+            await vad_stream.aclose()
+
+    async def _vad_task(self, vad_stream: agents_vad.VADStream, offset: float) -> None:
+        async for ev in vad_stream:
+            if ev.type == agents_vad.VADEventType.INFERENCE_DONE:
+                self._tracker.on_vad(ev.timestamp + offset, ev.probability, wall=time.time())
+
+    async def _run_ws(self, vad_stream: agents_vad.VADStream, offset: float) -> None:
+        closing_ws = False
+        # ids of the flushes the caller asked for, whose reply must always yield a final
+        manual_flushes: set[int] = set()
+        tracker = self._tracker
+
+        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            nonlocal closing_ws
+            audio_bstream = utils.audio.AudioByteStream(
+                sample_rate=SUPPORTED_SAMPLE_RATE, num_channels=1, samples_per_channel=1920
+            )
+            async for data in self._input_ch:
+                flush_id: int | None = None
+                frames: list[rtc.AudioFrame]
+                if isinstance(data, self._TurnFlush):
+                    # the flush covers the audio sent so far, partial frame included
+                    frames = audio_bstream.flush()
+                    flush_id = data.flush_id
+                elif isinstance(data, self._FlushSentinel):
+                    frames = audio_bstream.flush()
+                    self._flush_count += 1
+                    flush_id = self._flush_count
+                    manual_flushes.add(flush_id)
+                else:
+                    vad_stream.push_frame(data)
+                    self._audio_pushed_s += data.samples_per_channel / data.sample_rate
+                    frames = audio_bstream.write(data.data.tobytes())
+
+                try:
+                    for frame in frames:
+                        msg = {"type": "audio", "audio": base64.b64encode(frame.data).decode()}
+                        await ws.send_str(json.dumps(msg))
+                    if flush_id is not None:
+                        await ws.send_str(json.dumps({"type": "flush", "flush_id": flush_id}))
+                except (aiohttp.ClientError, ConnectionError):
+                    return  # the server closed first; recv_task raises the retryable error
+
+            closing_ws = True
+            try:
+                await ws.send_str(json.dumps({"type": "end_of_stream"}))
+            except (aiohttp.ClientError, ConnectionError):
+                return
+
+        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
+            loop = asyncio.get_running_loop()
+            monitor = utils.aio.WebSocketMonitor(
+                ws, liveness_timeout=self._conn_options.liveness_timeout
+            )
+            while True:
+                wait = 5.0
+                pending = tracker.pending_flush
+                if pending is not None and (deadline := self._flush_deadlines.get(pending)):
+                    wait = deadline - loop.time()
+                    if wait <= 0:
+                        # keep what the model already produced rather than hold the turn
+                        logger.warning(
+                            "Gradium did not answer flush %d within %.1fs, going on without it",
+                            pending,
+                            self._conn_options.timeout,
+                        )
+                        self._flush_deadlines.pop(pending, None)
+                        tracker.on_flushed(pending)
+                        continue
+                try:
+                    msg = await asyncio.wait_for(monitor.receive(), timeout=wait)
+                except asyncio.TimeoutError:
+                    if closing_ws:
+                        tracker.commit()
+                        return
+                    continue
+
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    if closing_ws:
+                        tracker.commit()
+                        return
+                    raise APIStatusError(
+                        "Gradium connection closed unexpectedly",
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
+                    )
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.error("Unexpected Gradium message type: %s", msg.type)
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    logger.exception("Failed to decode message from Gradium")
+                    continue
+                if not isinstance(data, dict):
+                    logger.error("Unexpected Gradium message: %s", msg.data)
+                    continue
+
+                type_ = data.get("type", "")
+                if type_ == "error":
+                    tracker.commit()
+                    raise _api_error(data)
+                if type_ == "end_of_stream":
+                    tracker.commit()
+                    if closing_ws:
+                        return
+                    raise APIStatusError(
+                        "Gradium ended the session while input was still open",
+                        status_code=ws.close_code or -1,
+                        body=data,
+                    )
+                try:
+                    self._handle_message(type_, data, offset, manual_flushes)
+                except Exception:
+                    logger.exception("Failed to process message from Gradium")
+
+        ws = await self._connect_ws()
+        try:
+            self._input_ch.restart_provider_clock()
+            tasks = [asyncio.create_task(send_task(ws)), asyncio.create_task(recv_task(ws))]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                await utils.aio.gracefully_cancel(*tasks)
+        finally:
+            await ws.close()
+
+    def _handle_message(
+        self, type_: str, data: dict[str, Any], offset: float, manual_flushes: set[int]
+    ) -> None:
+        tracker = self._tracker
+        if type_ == "step":
+            if data.get("total_duration_s", 0.0) <= 0:
+                return  # sent before any audio was processed: a warm-up estimate
+            probs = [
+                v["inactivity_prob"] for v in sorted(data["vad"], key=lambda v: v["horizon_s"])
+            ]
+            tracker.on_step(data["total_duration_s"] + offset, probs)
+            self._mark_provider_progress()
+        elif type_ == "text":
+            tracker.on_text(data["text"])
+            self._mark_provider_progress()
+        elif type_ == "end_text":
+            tracker.on_end_text(data["stop_s"] + offset)
+            self._mark_provider_progress()
+        elif type_ == "flushed":
+            flush_id = data.get("flush_id")
+            if not isinstance(flush_id, int):
+                return
+            self._flush_deadlines.pop(flush_id, None)
+            if flush_id in manual_flushes:
+                manual_flushes.discard(flush_id)
+                if tracker.turn_open:
+                    tracker.commit()
+                else:
+                    # nothing was heard, but the caller's flush still needs a final
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(text="", language=self._opts.language)],
+                        )
+                    )
+            else:
+                tracker.on_flushed(flush_id)
+        elif type_ == "ready":
+            if isinstance(delay := data.get("delay_in_frames"), int) and delay > 0:
+                tracker.set_delay_in_frames(delay)
+        elif type_ == "log":
+            log_server_message(data)
+        else:
+            logger.warning("Unknown message type from Gradium: %s", type_)
+
+    async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
+        ws = await self._session.ws_connect(
+            self._model_endpoint, headers=ws_headers(self._api_key), autoping=False
+        )
+        json_config: dict[str, Any] = {"language": self._opts.language.language}
+        if self._opts.delay_in_frames is not None:
+            json_config["delay_in_frames"] = self._opts.delay_in_frames
+        if self._opts.temperature is not None:
+            json_config["temp"] = self._opts.temperature
+        if self._opts.keywords:
+            keywords: dict[str, Any] = {"words": self._opts.keywords}
+            if self._opts.keyword_boost is not None:
+                keywords["boost"] = self._opts.keyword_boost
+            json_config["keywords"] = keywords
+        setup: dict[str, Any] = {
+            "type": "setup",
+            "model_name": self._model_name,
+            "input_format": "pcm",
+            "json_config": json_config,
+        }
+        if self._opts.log_level is not None:
+            setup["log_level"] = self._opts.log_level
+        await ws.send_str(json.dumps(setup))
+        return ws
