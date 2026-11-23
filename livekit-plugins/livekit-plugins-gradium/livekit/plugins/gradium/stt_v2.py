@@ -33,7 +33,6 @@ import contextlib
 import dataclasses
 import enum
 import json
-import os
 import time
 import weakref
 from collections.abc import Callable, Mapping
@@ -47,26 +46,32 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
     APIError,
-    APIStatusError,
     LanguageCode,
     stt,
     utils,
     vad as agents_vad,
 )
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
-from livekit.agents.utils import AudioBuffer, is_given
+from livekit.agents.utils import is_given
 
-from .api import ws_headers
+from ._stt_common import (
+    DEFAULT_DELAY_IN_FRAMES,
+    FRAME_S,
+    FRAME_SAMPLES,
+    SUPPORTED_SAMPLE_RATE,
+    GradiumSTTBase,
+    SocketClosed,
+    connect,
+    receive_message,
+    session_ended_error,
+)
 from .log import log_server_message, logger
 from .models import LogLevel
-from .stt import SUPPORTED_SAMPLE_RATE, _api_error
 
 EagerPreflightTrigger: TypeAlias = Literal["eager"]
 
 DELAYS_IN_FRAMES = (7, 8, 10, 12, 14, 16, 20, 24, 36, 48)
 """The `delay_in_frames` values Gradium accepts."""
-_FRAME_S = 0.08
-_DEFAULT_DELAY_IN_FRAMES = 10
 # A word that ends this long after the local VAD placed the start of a pause was spoken
 # during that pause: the local VAD missed it, and the user is talking again. A word's
 # `stop_s` lands within ~0.05 s of its real end and the VAD places a pause up to ~0.1 s
@@ -165,7 +170,7 @@ class STTV2Options:
 _DEFAULTS = STTV2Options()
 
 
-class STTV2(stt.STT):
+class STTV2(GradiumSTTBase):
     def __init__(
         self,
         *,
@@ -337,56 +342,14 @@ class STTV2(stt.STT):
         )
 
         super().__init__(
-            capabilities=stt.STTCapabilities(
-                streaming=True,
-                interim_results=True,
-                aligned_transcript=False,
-                offline_recognize=False,
-                manual_flush=True,
-            ),
+            api_key=api_key,
+            model_endpoint=model_endpoint,
+            model_name=model_name,
+            http_session=http_session,
         )
-
-        api_key = api_key or os.environ.get("GRADIUM_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "Gradium API key is required. "
-                "Pass one in via the `api_key` parameter, "
-                "or set it as the `GRADIUM_API_KEY` environment variable"
-            )
-        self._api_key = api_key
-        self._model_endpoint = (
-            model_endpoint
-            or os.environ.get("GRADIUM_MODEL_ENDPOINT")
-            or "wss://api.gradium.ai/api/speech/asr"
-        )
-        self._model_name = model_name
         self._vad = vad
         self._opts = opts
-        self._session = http_session
         self._streams = weakref.WeakSet[SpeechStreamV2]()
-
-    @property
-    def model(self) -> str:
-        return self._model_name
-
-    @property
-    def provider(self) -> str:
-        return "Gradium"
-
-    @property
-    def session(self) -> aiohttp.ClientSession:
-        if not self._session:
-            self._session = utils.http_context.http_session()
-        return self._session
-
-    async def _recognize_impl(
-        self,
-        buffer: AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions,
-    ) -> stt.SpeechEvent:
-        raise NotImplementedError("Gradium STT only supports streaming")
 
     def update_options(
         self,
@@ -481,7 +444,7 @@ class _TurnTracker:
         self._opts = opts
         self._emit = emit
         self._request_flush = request_flush
-        self._delay_in_frames = opts.delay_in_frames or _DEFAULT_DELAY_IN_FRAMES
+        self._delay_in_frames = opts.delay_in_frames or DEFAULT_DELAY_IN_FRAMES
 
         # local VAD
         self._vad_t = 0.0
@@ -542,7 +505,7 @@ class _TurnTracker:
     @property
     def word_lag_s(self) -> float:
         """How long after it is spoken a word can still be on its way from Gradium."""
-        return self._delay_in_frames * _FRAME_S + _WORD_LAG_S
+        return self._delay_in_frames * FRAME_S + _WORD_LAG_S
 
     def set_delay_in_frames(self, delay: int) -> None:
         """The model delay the server reports in `ready`."""
@@ -945,7 +908,7 @@ class SpeechStreamV2(stt.SpeechStream):
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws
             audio_bstream = utils.audio.AudioByteStream(
-                sample_rate=SUPPORTED_SAMPLE_RATE, num_channels=1, samples_per_channel=1920
+                sample_rate=SUPPORTED_SAMPLE_RATE, num_channels=1, samples_per_channel=FRAME_SAMPLES
             )
             async for data in self._input_ch:
                 flush_id: int | None = None
@@ -984,52 +947,26 @@ class SpeechStreamV2(stt.SpeechStream):
             )
             while True:
                 try:
-                    msg = await asyncio.wait_for(monitor.receive(), timeout=5.0)
-                except asyncio.TimeoutError:
+                    data = await receive_message(ws, monitor, timeout=5.0)
+                except SocketClosed as closed:
+                    if closing_ws:
+                        tracker.commit("connection closed after the input")
+                        return
+                    raise closed.error from None
+                if data is None:
                     if closing_ws:
                         tracker.commit("no end_of_stream reply")
                         return
                     continue
 
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    if closing_ws:
-                        tracker.commit("connection closed after the input")
-                        return
-                    raise APIStatusError(
-                        "Gradium connection closed unexpectedly",
-                        status_code=ws.close_code or -1,
-                        body=f"{msg.data=} {msg.extra=}",
-                    )
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.error("Unexpected Gradium message type: %s", msg.type)
-                    continue
-                try:
-                    data = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    logger.exception("Failed to decode message from Gradium")
-                    continue
-                if not isinstance(data, dict):
-                    logger.error("Unexpected Gradium message: %s", msg.data)
-                    continue
-
                 type_ = data.get("type", "")
-                if type_ == "error":
-                    raise _api_error(data)
                 if type_ == "step":
                     self._check_horizons(data)
                 if type_ == "end_of_stream":
                     if closing_ws:
                         tracker.commit("end_of_stream")
                         return
-                    raise APIStatusError(
-                        "Gradium ended the session while input was still open",
-                        status_code=ws.close_code or -1,
-                        body=data,
-                    )
+                    raise session_ended_error(ws, data)
                 try:
                     self._handle_message(type_, data, offset, manual_flushes)
                 except Exception:
@@ -1117,26 +1054,15 @@ class SpeechStreamV2(stt.SpeechStream):
             logger.warning("Unknown message type from Gradium: %s", type_)
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
-        ws = await self._session.ws_connect(
-            self._model_endpoint, headers=ws_headers(self._api_key), autoping=False
+        return await connect(
+            self._session,
+            endpoint=self._model_endpoint,
+            api_key=self._api_key,
+            model_name=self._model_name,
+            language=self._opts.language,
+            temperature=self._opts.temperature,
+            keywords=self._opts.keywords,
+            keyword_boost=self._opts.keyword_boost,
+            log_level=self._opts.log_level,
+            delay_in_frames=self._opts.delay_in_frames,
         )
-        json_config: dict[str, Any] = {"language": self._opts.language.language}
-        if self._opts.delay_in_frames is not None:
-            json_config["delay_in_frames"] = self._opts.delay_in_frames
-        if self._opts.temperature is not None:
-            json_config["temp"] = self._opts.temperature
-        if self._opts.keywords:
-            keywords: dict[str, Any] = {"words": self._opts.keywords}
-            if self._opts.keyword_boost is not None:
-                keywords["boost"] = self._opts.keyword_boost
-            json_config["keywords"] = keywords
-        setup: dict[str, Any] = {
-            "type": "setup",
-            "model_name": self._model_name,
-            "input_format": "pcm",
-            "json_config": json_config,
-        }
-        if self._opts.log_level is not None:
-            setup["log_level"] = self._opts.log_level
-        await ws.send_str(json.dumps(setup))
-        return ws

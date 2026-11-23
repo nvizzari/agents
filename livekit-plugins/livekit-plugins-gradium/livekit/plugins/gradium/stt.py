@@ -19,7 +19,6 @@ import asyncio
 import base64
 import dataclasses
 import json
-import os
 import weakref
 from collections import deque
 from dataclasses import dataclass
@@ -30,19 +29,27 @@ import aiohttp
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
-    APIStatusError,
+    APIError,
     LanguageCode,
     stt,
     utils,
 )
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
-from livekit.agents.utils import AudioBuffer, is_given
+from livekit.agents.utils import is_given
 from livekit.rtc import AudioFrame
 
-from .api import ws_headers
+from ._stt_common import (
+    DEFAULT_DELAY_IN_FRAMES,
+    FRAME_SAMPLES,
+    SUPPORTED_SAMPLE_RATE,
+    GradiumSTTBase,
+    SocketClosed,
+    connect,
+    receive_message,
+    session_ended_error,
+)
 from .log import log_server_message, logger
 from .models import LogLevel
-from .tts import _close_error
 
 STTEncoding = Literal["pcm_s16le"]
 
@@ -52,25 +59,7 @@ bytes_per_frame = {
 }
 
 
-SUPPORTED_SAMPLE_RATE = 24000
-# Gradium's default model delay, used until the server's ready message arrives
-DEFAULT_DELAY_IN_FRAMES = 10
-
-
 PreflightTrigger: TypeAlias = Literal["vad_trip"]
-
-
-def _api_error(msg_data: dict[str, Any]) -> APIStatusError:
-    """Build the error for a `{"type": "error"}` frame.
-
-    The server sends it right before closing the socket, so the message is the only
-    place the actual failure reason (unsupported language, no credits, ...) shows up.
-    Its `code` is the websocket close code that follows; client errors are not retried.
-    """
-    message = msg_data.get("message") or "unknown error"
-    return _close_error(
-        f"Gradium returned error: {message}", code=msg_data.get("code"), body=msg_data
-    )
 
 
 @dataclass
@@ -99,7 +88,7 @@ class STTOptions:
     log_level: LogLevel | None = None
 
 
-class STT(stt.STT):
+class STT(GradiumSTTBase):
     def __init__(
         self,
         *,
@@ -144,38 +133,15 @@ class STT(stt.STT):
                 f"expected one of {get_args(PreflightTrigger)} or None"
             )
 
-        super().__init__(
-            capabilities=stt.STTCapabilities(
-                streaming=True,
-                interim_results=True,
-                aligned_transcript=False,  # only chunk start times are available
-                offline_recognize=False,
-                manual_flush=True,
-            ),
-        )
-
-        api_key = api_key or os.environ.get("GRADIUM_API_KEY")
-
         if sample_rate != SUPPORTED_SAMPLE_RATE:
             raise ValueError(f"Only {SUPPORTED_SAMPLE_RATE}Hz sample rate is supported")
 
-        if not api_key:
-            raise ValueError(
-                "Gradium API key is required. "
-                "Pass one in via the `api_key` parameter, "
-                "or set it as the `GRADIUM_API_KEY` environment variable"
-            )
-
-        self._api_key = api_key
-
-        model_endpoint = (
-            model_endpoint
-            or os.environ.get("GRADIUM_MODEL_ENDPOINT")
-            or "wss://api.gradium.ai/api/speech/asr"
+        super().__init__(
+            api_key=api_key,
+            model_endpoint=model_endpoint,
+            model_name=model_name,
+            http_session=http_session,
         )
-
-        self._model_endpoint = model_endpoint
-        self._model_name = model_name
 
         self._opts = STTOptions(
             sample_rate=sample_rate,
@@ -195,31 +161,7 @@ class STT(stt.STT):
         if is_given(encoding):
             self._opts.encoding = encoding
 
-        self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
-
-    @property
-    def model(self) -> str:
-        return self._model_name
-
-    @property
-    def provider(self) -> str:
-        return "Gradium"
-
-    @property
-    def session(self) -> aiohttp.ClientSession:
-        if not self._session:
-            self._session = utils.http_context.http_session()
-        return self._session
-
-    async def _recognize_impl(
-        self,
-        buffer: AudioBuffer,
-        *,
-        language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions,
-    ) -> stt.SpeechEvent:
-        raise NotImplementedError("Not implemented")
 
     def stream(
         self,
@@ -346,8 +288,8 @@ class SpeechStream(stt.SpeechStream):
     @property
     def frame_size(self) -> int:
         if self._ready_msg is not None:
-            return int(self._ready_msg.get("frame_size", 1920))
-        return 1920
+            return int(self._ready_msg.get("frame_size", FRAME_SAMPLES))
+        return FRAME_SAMPLES
 
     def update_options(
         self,
@@ -371,7 +313,7 @@ class SpeechStream(stt.SpeechStream):
 
         async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws, flush_count
-            samples_per_buffer = 1920
+            samples_per_buffer = FRAME_SAMPLES
 
             audio_bstream = utils.audio.AudioByteStream(
                 sample_rate=self._opts.sample_rate,
@@ -491,8 +433,18 @@ class SpeechStream(stt.SpeechStream):
 
             while True:
                 try:
-                    msg = await asyncio.wait_for(monitor.receive(), timeout=5)
-                except asyncio.TimeoutError:
+                    data = await receive_message(ws, monitor, timeout=5)
+                except SocketClosed as closed:
+                    if closing_ws:
+                        # a close instead of the server's end_of_stream: same thing
+                        _finalize()
+                        return
+                    raise closed.error from None
+                except APIError:
+                    # the words the model already produced are still valid
+                    _finalize()
+                    raise
+                if data is None:
                     if closing_ws:
                         # the server did not answer the end_of_stream in time: keep
                         # what the model already produced
@@ -500,54 +452,14 @@ class SpeechStream(stt.SpeechStream):
                         return
                     continue
 
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    if closing_ws:
-                        # a close instead of the server's end_of_stream: same thing
-                        _finalize()
-                        return
-                    raise APIStatusError(
-                        "Gradium connection closed unexpectedly",
-                        status_code=ws.close_code or -1,
-                        body=f"{msg.data=} {msg.extra=}",
-                    )
-
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.error("Unexpected Gradium message type: %s", msg.type)
-                    continue
-
-                try:
-                    data = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    logger.exception("Failed to decode message from Gradium")
-                    continue
-                if not isinstance(data, dict):
-                    logger.error("Unexpected Gradium message: %s", msg.data)
-                    continue
-
                 type_ = data.get("type", "")
-                if type_ == "error":
-                    # the words the model already produced are still valid
-                    _finalize()
-                    raise _api_error(data)
                 if type_ == "end_of_stream":
                     # The model has consumed all the audio: whatever is still buffered
                     # is the end of the last utterance.
                     _finalize()
                     if closing_ws:
                         return
-                    # The server ended the session while audio is still coming (a
-                    # duration limit, for instance) and will close the socket; raise
-                    # so the base class reconnects instead of the next audio write
-                    # failing with a raw connection error.
-                    raise APIStatusError(
-                        "Gradium ended the session while input was still open",
-                        status_code=ws.close_code or -1,
-                        body=data,
-                    )
+                    raise session_ended_error(ws, data)
 
                 try:
                     if type_ == "text":
@@ -679,27 +591,14 @@ class SpeechStream(stt.SpeechStream):
                     await ws.close()
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
-        ws = await self._session.ws_connect(
-            self._model_endpoint, headers=ws_headers(self._api_key), autoping=False
+        return await connect(
+            self._session,
+            endpoint=self._model_endpoint,
+            api_key=self._api_key,
+            model_name=self._model_name,
+            language=self._opts.language,
+            temperature=self._opts.temperature,
+            keywords=self._opts.keywords,
+            keyword_boost=self._opts.keyword_boost,
+            log_level=self._opts.log_level,
         )
-
-        # Build and send the setup payload as the first message
-        setup_msg: dict[str, Any] = {
-            "type": "setup",
-            "model_name": self._model_name,
-            "input_format": "pcm",
-        }
-        json_config: dict[str, Any] = {"language": self._opts.language.language}
-        if self._opts.temperature is not None:
-            json_config["temp"] = self._opts.temperature
-        if self._opts.keywords:
-            keywords: dict[str, Any] = {"words": self._opts.keywords}
-            if self._opts.keyword_boost is not None:
-                keywords["boost"] = self._opts.keyword_boost
-            json_config["keywords"] = keywords
-        setup_msg["json_config"] = json_config
-        if self._opts.log_level is not None:
-            setup_msg["log_level"] = self._opts.log_level
-
-        await ws.send_str(json.dumps(setup_msg))
-        return ws
