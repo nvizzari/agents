@@ -16,7 +16,7 @@ import aiohttp
 import pytest
 
 from livekit import rtc
-from livekit.agents import APIConnectOptions
+from livekit.agents import APIConnectOptions, APIStatusError
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.agents.vad import VAD, VADCapabilities, VADEvent, VADEventType, VADStream
 from livekit.plugins.gradium import STTV2
@@ -464,3 +464,54 @@ async def test_after_a_reconnect_gradium_and_the_vad_stay_on_the_stream_clock():
         await _until(lambda: SpeechEventType.END_OF_SPEECH in collector.types())
     finally:
         await collector.close(stream)
+
+
+async def test_transient_server_error_does_not_end_the_turn():
+    # The stream reconnects after a retryable error while the user may still be talking:
+    # ending the turn there would make the agent answer half a sentence.
+    ws1, ws2 = _QueueWebSocket(), _QueueWebSocket()
+    vad = _ScriptedVAD()
+    stt = STTV2(vad=vad, api_key="test-key", http_session=_Session(ws1, ws2))  # type: ignore[arg-type]
+    stream = stt.stream(conn_options=APIConnectOptions(max_retry=1, retry_interval=0.1, timeout=5))
+    collector = _Collector(stream)
+    try:
+        vad.prob = SPEECH
+        await _push(stream, 0.4)
+        ws1.server({"type": "text", "text": "I", "start_s": 0.0})
+        ws1.server({"type": "end_text", "stop_s": 0.4})
+        await _until(lambda: SpeechEventType.INTERIM_TRANSCRIPT in collector.types())
+        ws1.server({"type": "error", "message": "worker failure", "code": 1011})
+        await _push(stream, 0.3)
+        ws2.server({"type": "text", "text": "want", "start_s": 0.0})
+        ws2.server({"type": "end_text", "stop_s": 0.3})
+        vad.prob = SILENCE
+        await _push(stream, 0.3)
+        ws2.server(_step(0.6, 0.99))
+        await _until(lambda: bool(ws2.sent_of("flush")))
+        ws2.server({"type": "flushed", "flush_id": ws2.sent_of("flush")[0]["flush_id"]})
+        await _until(lambda: SpeechEventType.END_OF_SPEECH in collector.types())
+        finals = [e for e in collector.events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert [e.alternatives[0].text for e in finals] == ["I want"]
+    finally:
+        await collector.close(stream)
+
+
+async def test_words_are_final_when_the_stream_gives_up():
+    # When no retry is left, the words already transcribed are all the user will get:
+    # they must still reach the session as a final.
+    ws = _QueueWebSocket()
+    vad = _ScriptedVAD()
+    stt = STTV2(vad=vad, api_key="test-key", http_session=_Session(ws))  # type: ignore[arg-type]
+    stream = stt.stream(conn_options=APIConnectOptions(max_retry=0, timeout=5))
+    events: list[SpeechEvent] = []
+    vad.prob = SPEECH
+    await _push(stream, 0.4)
+    ws.server({"type": "text", "text": "hello", "start_s": 0.0})
+    ws.server({"type": "error", "message": "worker failure", "code": 1011})
+    with pytest.raises(APIStatusError):
+        async with asyncio.timeout(5):
+            async for ev in stream:
+                events.append(ev)
+    finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+    assert [e.alternatives[0].text for e in finals] == ["hello"]
+    await stream.aclose()

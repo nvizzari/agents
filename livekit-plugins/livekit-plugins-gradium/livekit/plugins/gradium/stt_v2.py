@@ -46,6 +46,7 @@ from livekit import rtc
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
+    APIError,
     APIStatusError,
     LanguageCode,
     stt,
@@ -686,6 +687,12 @@ class SpeechStreamV2(stt.SpeechStream):
                 vad_task.result()  # raises the VAD's error
                 raise RuntimeError("the local VAD stream ended before the input")
             ws_task.result()
+        except APIError as e:
+            # The turn survives a reconnect, so a transient failure must not end it while
+            # the user is talking; only when the stream gives up are its words final.
+            if not e.retryable or self._num_retries >= self._conn_options.max_retry:
+                self._tracker.commit()
+            raise
         finally:
             await utils.aio.cancel_and_wait(ws_task, vad_task)
             await vad_stream.aclose()
@@ -793,11 +800,10 @@ class SpeechStreamV2(stt.SpeechStream):
 
                 type_ = data.get("type", "")
                 if type_ == "error":
-                    tracker.commit()
                     raise _api_error(data)
                 if type_ == "end_of_stream":
-                    tracker.commit()
                     if closing_ws:
+                        tracker.commit()
                         return
                     raise APIStatusError(
                         "Gradium ended the session while input was still open",
