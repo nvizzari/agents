@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import enum
 import json
@@ -77,6 +78,9 @@ _WORD_RESUME_MARGIN_S = 0.25
 # How long, beyond its model delay, Gradium takes to send a word: measured 1.0 s at delay
 # 7 and 1.2 s at delay 10 from the start of the word, at p50.
 _WORD_LAG_S = 0.6
+# How long to wait for a `flushed` reply before ending the turn without it: several times
+# the measured 0.2-0.35 s round trip.
+_FLUSH_REPLY_TIMEOUT_S = 1.5
 # How often the stream checks that audio still reaches the local VAD while a turn is open.
 _STALL_CHECK_S = 0.1
 # Audio pushed to the local VAD but not processed yet, beyond its window and resampling.
@@ -677,24 +681,31 @@ class SpeechStreamV2(stt.SpeechStream):
         self._model_name = model_name
         self._session = http_session
         # ids are never reused, so a reply from an earlier connection cannot match
-        self._flush_count = 0
+        self._last_flush_id = 0
         # seconds of audio taken from the input over every connection so far
         self._audio_pushed_s = 0.0
-        # when to stop waiting for the reply to each pending flush, in event-loop time
-        self._flush_deadlines: dict[int, float] = {}
+        # the turn flush awaiting its reply, and when to stop waiting, in event-loop time
+        self._flush_deadline: tuple[int, float] | None = None
+        self._flush_requested = asyncio.Event()
+        # after a flush timed out and ended the turn, its words may still come: they
+        # belong to that turn, so drop them until its reply, or until this event-loop time
+        self._timed_out_flush: tuple[int, float] | None = None
         self._tracker = _TurnTracker(
             opts, emit=self._event_ch.send_nowait, request_flush=self._request_turn_flush
         )
 
+    def _next_flush_id(self) -> int:
+        self._last_flush_id += 1
+        return self._last_flush_id
+
     def _request_turn_flush(self) -> int:
-        self._flush_count += 1
-        flush_id = self._flush_count
+        flush_id = self._next_flush_id()
         if self._input_ch.closed:
             # no flush can follow end_of_stream: the server's own end_of_stream ends the turn
             return flush_id
-        self._flush_deadlines[flush_id] = (
-            asyncio.get_running_loop().time() + self._conn_options.timeout
-        )
+        deadline = asyncio.get_running_loop().time() + _FLUSH_REPLY_TIMEOUT_S
+        self._flush_deadline = (flush_id, deadline)
+        self._flush_requested.set()
         self._input_ch.send_nowait(self._TurnFlush(flush_id))
         return flush_id
 
@@ -704,12 +715,13 @@ class SpeechStreamV2(stt.SpeechStream):
         offset = self._audio_pushed_s
         if self._tracker.pending_flush is not None:
             # its reply was due on the connection that failed
-            self._flush_deadlines.clear()
+            self._flush_deadline = None
             self._tracker.on_flush_lost()
         vad_stream = self._vad.stream()
         vad_task = asyncio.create_task(self._vad_task(vad_stream, offset))
         ws_task = asyncio.create_task(self._run_ws(vad_stream, offset))
         watchdog = asyncio.create_task(self._stall_watchdog())
+        flush_timer = asyncio.create_task(self._flush_timer())
         try:
             done, _ = await asyncio.wait([vad_task, ws_task], return_when=asyncio.FIRST_COMPLETED)
             if ws_task not in done:
@@ -723,8 +735,35 @@ class SpeechStreamV2(stt.SpeechStream):
                 self._tracker.commit()
             raise
         finally:
-            await utils.aio.cancel_and_wait(ws_task, vad_task, watchdog)
+            await utils.aio.cancel_and_wait(ws_task, vad_task, watchdog, flush_timer)
             await vad_stream.aclose()
+
+    async def _flush_timer(self) -> None:
+        """Go on without a turn flush's reply once it is `_FLUSH_REPLY_TIMEOUT_S` late."""
+        loop = asyncio.get_running_loop()
+        while True:
+            self._flush_requested.clear()
+            if self._flush_deadline is None:
+                await self._flush_requested.wait()
+                continue
+            flush_id, deadline = self._flush_deadline
+            if (delay := deadline - loop.time()) > 0:
+                # a newer flush replaces this one and wakes the timer
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._flush_requested.wait(), delay)
+                continue
+            self._flush_deadline = None
+            if self._tracker.pending_flush != flush_id:
+                continue
+            logger.warning(
+                "Gradium did not answer flush %d within %.1fs, going on without it",
+                flush_id,
+                _FLUSH_REPLY_TIMEOUT_S,
+            )
+            was_open = self._tracker.turn_open
+            self._tracker.on_flushed(flush_id)
+            if was_open and not self._tracker.turn_open:
+                self._timed_out_flush = (flush_id, loop.time() + _FLUSH_REPLY_TIMEOUT_S)
 
     async def _stall_watchdog(self) -> None:
         """End the open turn once no audio has reached the local VAD for `max_silence`."""
@@ -766,8 +805,7 @@ class SpeechStreamV2(stt.SpeechStream):
                     flush_id = data.flush_id
                 elif isinstance(data, self._FlushSentinel):
                     frames = audio_bstream.flush()
-                    self._flush_count += 1
-                    flush_id = self._flush_count
+                    flush_id = self._next_flush_id()
                     manual_flushes.add(flush_id)
                 else:
                     vad_stream.push_frame(data)
@@ -790,27 +828,12 @@ class SpeechStreamV2(stt.SpeechStream):
                 return
 
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            loop = asyncio.get_running_loop()
             monitor = utils.aio.WebSocketMonitor(
                 ws, liveness_timeout=self._conn_options.liveness_timeout
             )
             while True:
-                wait = 5.0
-                pending = tracker.pending_flush
-                if pending is not None and (deadline := self._flush_deadlines.get(pending)):
-                    wait = deadline - loop.time()
-                    if wait <= 0:
-                        # keep what the model already produced rather than hold the turn
-                        logger.warning(
-                            "Gradium did not answer flush %d within %.1fs, going on without it",
-                            pending,
-                            self._conn_options.timeout,
-                        )
-                        self._flush_deadlines.pop(pending, None)
-                        tracker.on_flushed(pending)
-                        continue
                 try:
-                    msg = await asyncio.wait_for(monitor.receive(), timeout=wait)
+                    msg = await asyncio.wait_for(monitor.receive(), timeout=5.0)
                 except asyncio.TimeoutError:
                     if closing_ws:
                         tracker.commit()
@@ -874,6 +897,10 @@ class SpeechStreamV2(stt.SpeechStream):
         self, type_: str, data: dict[str, Any], offset: float, manual_flushes: set[int]
     ) -> None:
         tracker = self._tracker
+        if type_ in ("text", "end_text") and self._timed_out_flush is not None:
+            if asyncio.get_running_loop().time() < self._timed_out_flush[1]:
+                return  # held words of a turn that ended without them
+            self._timed_out_flush = None
         if type_ == "step":
             if data.get("total_duration_s", 0.0) <= 0:
                 return  # sent before any audio was processed: a warm-up estimate
@@ -895,7 +922,10 @@ class SpeechStreamV2(stt.SpeechStream):
             flush_id = data.get("flush_id")
             if not isinstance(flush_id, int):
                 return
-            self._flush_deadlines.pop(flush_id, None)
+            if self._flush_deadline is not None and self._flush_deadline[0] == flush_id:
+                self._flush_deadline = None
+            if self._timed_out_flush is not None and self._timed_out_flush[0] == flush_id:
+                self._timed_out_flush = None
             if flush_id in manual_flushes:
                 manual_flushes.discard(flush_id)
                 if tracker.turn_open:

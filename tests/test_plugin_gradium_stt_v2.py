@@ -370,9 +370,10 @@ def test_inconsistent_options_are_rejected(options):
 class _QueueWebSocket:
     """Server side driven by the test: `server()` queues a message for the client."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, auto_eos: bool = True) -> None:
         self.sent: list[dict[str, Any]] = []
         self.close_code: int | None = None
+        self._auto_eos = auto_eos
         self._inbox: asyncio.Queue[aiohttp.WSMessage] = asyncio.Queue()
 
     def server(self, msg: dict[str, Any]) -> None:
@@ -384,7 +385,7 @@ class _QueueWebSocket:
     async def send_str(self, data: str) -> None:
         msg = json.loads(data)
         self.sent.append(msg)
-        if msg["type"] == "end_of_stream":
+        if msg["type"] == "end_of_stream" and self._auto_eos:
             self.server({"type": "end_of_stream"})
 
     async def receive(self, timeout: float | None = None) -> aiohttp.WSMessage:
@@ -433,8 +434,15 @@ class _Stream:
     the VAD calls speech or silence.
     """
 
-    def __init__(self, *, connections: int = 1, max_retry: int = 0, **overrides: Any) -> None:
-        self.sockets = [_QueueWebSocket() for _ in range(connections)]
+    def __init__(
+        self,
+        *,
+        connections: int = 1,
+        max_retry: int = 0,
+        auto_eos: bool = True,
+        **overrides: Any,
+    ) -> None:
+        self.sockets = [_QueueWebSocket(auto_eos=auto_eos) for _ in range(connections)]
         self.session = _Session(self.sockets)
         self.vad = _ScriptedVAD()
         stt = STTV2(vad=self.vad, api_key="test-key", http_session=self.session, **overrides)  # type: ignore[arg-type]
@@ -485,6 +493,14 @@ class _Stream:
     async def flush_sent(self) -> int:
         await _until(lambda: bool(self.ws.sent_of("flush")))
         return int(self.ws.sent_of("flush")[-1]["flush_id"])
+
+    async def pause_ends_turn(self) -> int:
+        """After "hello": a pause Gradium is sure of, up to the flush; returns its id."""
+        await self.speak(0.4)
+        self.word("hello", stop_s=0.4)
+        await self.quiet(0.3)
+        self.ws.server(_step(0.7, 0.99))
+        return await self.flush_sent()
 
     async def wait_for(self, type_: SpeechEventType) -> None:
         await _until(lambda: type_ in self.types())
@@ -578,5 +594,73 @@ async def test_turn_ends_when_the_audio_stops():
         await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
         # no more audio
         s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["hello"]
+
+
+async def test_unanswered_flush_ends_the_turn_on_time_and_its_late_words_are_dropped():
+    # A lost `flushed` must not hold the user's turn for long; and when the held words
+    # come after all, they belong to the turn already ended, not to a new one.
+    async with _Stream() as s:
+        flush_id = await s.pause_ends_turn()
+        loop = asyncio.get_running_loop()
+        sent_at = loop.time()
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert loop.time() - sent_at == pytest.approx(1.5, abs=0.15)
+
+        s.word("late", stop_s=0.7)
+        s.ws.server({"type": "flushed", "flush_id": flush_id})
+        await asyncio.sleep(0.1)
+        assert s.final_texts() == ["hello"]
+        assert s.types().count(SpeechEventType.START_OF_SPEECH) == 1
+
+
+async def test_flush_pending_at_a_reconnect_is_sent_again():
+    # Its reply was due on the connection that failed: without a new flush on the new
+    # connection, the turn would wait for the flush timeout.
+    async with _Stream(connections=2, max_retry=1) as s:
+        await s.pause_ends_turn()
+        s.ws.server_close()
+        await _until(lambda: s.session.connects == 2)
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["hello"]
+
+
+async def test_session_flush_ends_the_turn_on_its_reply():
+    # The session flushes the STT on its own turn decisions and waits for a final.
+    async with _Stream() as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.wait_for(SpeechEventType.INTERIM_TRANSCRIPT)
+        s.stream.flush()
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.END_OF_SPEECH)
+        assert s.final_texts() == ["hello"]
+
+
+async def test_session_flush_without_speech_gets_an_empty_final():
+    # Nothing was heard, but the session still waits for an answer to its flush.
+    async with _Stream() as s:
+        s.stream.flush()
+        s.ws.server({"type": "flushed", "flush_id": await s.flush_sent()})
+        await s.wait_for(SpeechEventType.FINAL_TRANSCRIPT)
+        assert s.final_texts() == [""]
+
+
+async def test_pause_decided_after_the_input_ended_is_left_to_the_server():
+    # No flush can follow end_of_stream: the server's own end_of_stream ends the turn.
+    async with _Stream(auto_eos=False) as s:
+        await s.speak(0.4)
+        s.word("hello", stop_s=0.4)
+        await s.quiet(0.06)
+        s.stream.end_input()
+        await _until(lambda: bool(s.ws.sent_of("end_of_stream")))
+        sent = len(s.ws.sent)  # end_input's own flush, then end_of_stream
+        s.ws.server(_step(0.7, 0.99))
+        await asyncio.sleep(0.1)
+        assert len(s.ws.sent) == sent
+
+        s.ws.server({"type": "end_of_stream"})
         await s.wait_for(SpeechEventType.END_OF_SPEECH)
         assert s.final_texts() == ["hello"]
