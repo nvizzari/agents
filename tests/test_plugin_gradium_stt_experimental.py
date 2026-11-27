@@ -19,7 +19,7 @@ import aiohttp
 import pytest
 
 from livekit import rtc
-from livekit.agents import APIConnectOptions, APIStatusError
+from livekit.agents import APIConnectionError, APIConnectOptions, APIStatusError
 from livekit.agents.stt import SpeechEvent, SpeechEventType
 from livekit.plugins.gradium.experimental import machine as m, signals
 from livekit.plugins.gradium.experimental.profiles import TurnProfile, preset
@@ -669,8 +669,8 @@ async def test_unexpected_close_keeps_words_and_retries_only_transient_failures(
 ) -> None:
     # A dropped socket must not lose the words received mid-pause; a server failure is
     # retried, while a request the server rejects as malformed (1002) is not. The words
-    # arrive as a final at once, but the user's turn is not ended by the drop: it ends
-    # on the next connection (here, at end of input).
+    # arrive as a final at once. A retried connection inherits the turn, while a
+    # terminal failure ends it before the stream raises.
     srv = Server()
     first = FakeWebSocket(
         [
@@ -691,6 +691,7 @@ async def test_unexpected_close_keeps_words_and_retries_only_transient_failures(
         with pytest.raises(APIStatusError):
             async for ev in stream:
                 events.append(ev)
+        assert events[-1].type == SpeechEventType.END_OF_SPEECH
     else:
         events = await collect(stream, until=is_type(SpeechEventType.FINAL_TRANSCRIPT))
         assert not of_type(events, SpeechEventType.END_OF_SPEECH)
@@ -703,6 +704,23 @@ async def test_unexpected_close_keeps_words_and_retries_only_transient_failures(
         assert len(of_type(events, SpeechEventType.START_OF_SPEECH)) == 1
     assert texts(events, SpeechEventType.FINAL_TRANSCRIPT)[0] == "still"
     assert len(session.connects) == connects
+
+
+async def test_failed_retry_setup_ends_the_inherited_turn() -> None:
+    # A turn handed to a retry that never connects has no later connection to end it.
+    # The session must still get END_OF_SPEECH before the stream raises, or it would
+    # wait on a user turn that can no longer end.
+    srv = Server()
+    ws = FakeWebSocket([srv.ready(), *srv.word("hello", 0.0, 0.3), 1011], close_code=1011)
+    _, stream, session = make_stream(ws, conn_options=ONE_RETRY)
+    async with stream:
+        events: list[SpeechEvent] = []
+        with pytest.raises(APIConnectionError):
+            async for ev in stream:
+                events.append(ev)
+    assert len(session.connects) == 2
+    assert texts(events, SpeechEventType.FINAL_TRANSCRIPT) == ["hello"]
+    assert events[-1].type == SpeechEventType.END_OF_SPEECH
 
 
 async def test_malformed_messages_are_skipped() -> None:

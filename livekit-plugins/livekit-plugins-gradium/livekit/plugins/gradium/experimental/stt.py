@@ -473,6 +473,14 @@ class SpeechStream(stt.SpeechStream):
 
     # connection
 
+    async def _main_task(self) -> None:
+        try:
+            await super()._main_task()
+        except Exception:
+            # A retry can inherit the open turn, but a replacement stream cannot.
+            self._emit(self._machine.finalize())
+            raise
+
     async def _run(self) -> None:
         while True:
             conn = _Connection(generation=self._generation)
