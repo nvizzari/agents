@@ -793,6 +793,31 @@ async def test_end_input_ends_the_turn_without_an_empty_final() -> None:
     assert not ws.sent_of("flush")
 
 
+async def test_drain_collects_words_without_sending_a_new_flush() -> None:
+    # After end_of_stream the server still returns steps and the last words. The words
+    # belong in the final transcript, but the steps must not drive the turn: a likely
+    # end of turn there would send a flush on a socket that is closing.
+    srv = Server()
+
+    class DrainSocket(FakeWebSocket):
+        async def send_str(self, data: str) -> None:
+            await super().send_str(data)
+            if json.loads(data)["type"] == "end_of_stream":
+                for msg in [*srv.steps(LIKELY, 8), *srv.word("there", 0.24, 0.32)]:
+                    self._text(msg)
+
+    ws = DrainSocket([srv.ready(), *srv.word("hello", 0.0, 0.16)])
+    _, stream, _ = make_stream(ws)
+    async with stream:
+        await collect(stream, until=is_type(SpeechEventType.INTERIM_TRANSCRIPT))
+        stream.end_input()
+        events = await collect(stream)
+
+    assert texts(events, SpeechEventType.FINAL_TRANSCRIPT) == ["hello there"]
+    assert events[-1].type == SpeechEventType.END_OF_SPEECH
+    assert not ws.sent_of("flush")
+
+
 @pytest.mark.parametrize("language", ["en", "ja-JP", "any", "not-a-language"])
 async def test_language_reaches_the_server_as_given(language: str) -> None:
     # The server owns the list of languages: the hint is sent untouched, so a new server

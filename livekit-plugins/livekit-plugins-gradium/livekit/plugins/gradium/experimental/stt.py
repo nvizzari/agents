@@ -640,6 +640,12 @@ class SpeechStream(stt.SpeechStream):
                 self._server_model = sig.model
                 await self._install_scorer(sig.model)
 
+            if conn.closing and isinstance(sig, signals.Step):
+                # Draining can still return buffered steps. Keep collecting words,
+                # but stop making turn decisions that could send a new flush.
+                self._mark_provider_progress()
+                continue
+
             if not isinstance(sig, (signals.EndOfStream, signals.ServerError)):
                 # the connection's end is handled once, by `_run`, which knows whether the
                 # user's turn continues on another connection
