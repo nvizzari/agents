@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .experimental import STTExperimental
 from .log import logger
 from .stt import STT, PreflightTrigger, SpeechStream
 from .tts import TTS
@@ -18,6 +19,7 @@ from .version import __version__
 __all__ = [
     "PreflightTrigger",
     "STT",
+    "STTExperimental",
     "SpeechStream",
     "logger",
     "TTS",
