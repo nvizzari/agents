@@ -773,6 +773,34 @@ async def test_update_options_reconnects_only_for_setup_options() -> None:
     assert stream.machine.profile.commit_threshold == 0.95
 
 
+async def test_provider_update_validates_every_stream_before_applying() -> None:
+    # A provider update is all or nothing. Streams can carry their own overrides, so an
+    # update valid for the provider can be invalid for one stream; rejecting it must
+    # leave the provider and every stream as they were, with no reconnect.
+    first = FakeWebSocket([Server.ready()])
+    second = FakeWebSocket([Server.ready()])
+    provider, stream_with_override, session = make_stream(first, second, pinned=False, weights=None)
+    other_stream = provider.stream(conn_options=NO_RETRY)
+
+    async with stream_with_override, other_stream:
+        stream_with_override.update_options(overrides={"min_silence": 1.0})
+        provider_profile = provider.profile
+        overridden_profile = stream_with_override.machine.profile
+
+        with pytest.raises(ValueError, match="must exceed min_silence"):
+            provider.update_options(language="fr", overrides={"max_silence": 0.8})
+
+        assert provider.profile == provider_profile
+        assert other_stream.machine.profile == provider_profile
+        assert stream_with_override.machine.profile == overridden_profile
+        for stream in (stream_with_override, other_stream):
+            stream.end_input()
+            await collect(stream)
+        assert len(session.connects) == 2
+        assert first.sent[0]["json_config"]["language"] == "en"
+        assert second.sent[0]["json_config"]["language"] == "en"
+
+
 async def test_end_input_ends_the_turn_without_an_empty_final() -> None:
     # end_input() queues a flush before closing the input. It is not a manual flush:
     # answering it emitted an empty FINAL_TRANSCRIPT outside any turn on every stream

@@ -351,9 +351,11 @@ class STTExperimental(stt.STT):
             "temperature": temperature,
             "log_level": log_level,
         }
-        self._settings = self._settings.updated(**kwargs)
-        for stream in self._streams:
-            stream.update_options(**kwargs)
+        settings = self._settings.updated(**kwargs)
+        stream_settings = [(stream, stream._settings.updated(**kwargs)) for stream in self._streams]
+        self._settings = settings
+        for stream, updated in stream_settings:
+            stream._apply_settings(updated)
 
 
 @dataclass
@@ -419,18 +421,22 @@ class SpeechStream(stt.SpeechStream):
         log_level: NotGivenOr[LogLevel | None] = NOT_GIVEN,
     ) -> None:
         """Same as `STTExperimental.update_options`, for this stream only."""
-        old = self._settings
-        new = old.updated(
-            eagerness=eagerness,
-            overrides=overrides,
-            weights=weights,
-            delay_in_frames=delay_in_frames,
-            language=language,
-            keywords=keywords,
-            keyword_boost=keyword_boost,
-            temperature=temperature,
-            log_level=log_level,
+        self._apply_settings(
+            self._settings.updated(
+                eagerness=eagerness,
+                overrides=overrides,
+                weights=weights,
+                delay_in_frames=delay_in_frames,
+                language=language,
+                keywords=keywords,
+                keyword_boost=keyword_boost,
+                temperature=temperature,
+                log_level=log_level,
+            )
         )
+
+    def _apply_settings(self, new: _Settings) -> None:
+        old = self._settings
         self._settings = new
         self._machine.profile = new.profile_for(self._machine.scorer)
         if new.weights != old.weights and self._server_ready is not None:
