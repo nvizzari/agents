@@ -394,6 +394,7 @@ class SpeechStream(stt.SpeechStream):
         # until `ready` names the server model, the fallback scorer and its thresholds
         fallback = FallbackScorer()
         self._machine = TurnMachine(settings.profile_for(fallback), fallback)
+        self._connection_language = settings.language
         self._request_id = ""
         self._server_ready: signals.Ready | None = None
         self._scorer_key: tuple[str | Path | None, str, int] | None = None
@@ -492,7 +493,9 @@ class SpeechStream(stt.SpeechStream):
     async def _run(self) -> None:
         while True:
             conn = _Connection(generation=self._generation)
-            ws = await self._connect_ws()
+            settings = self._settings
+            ws = await self._connect_ws(settings)
+            self._connection_language = settings.language
             self._input_ch.restart_provider_clock()
             ended = False
             try:
@@ -533,8 +536,7 @@ class SpeechStream(stt.SpeechStream):
         finally:
             await utils.aio.gracefully_cancel(send_task, recv_task)
 
-    async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
-        settings = self._settings
+    async def _connect_ws(self, settings: _Settings) -> aiohttp.ClientWebSocketResponse:
         try:
             ws = await asyncio.wait_for(
                 self._session.ws_connect(
@@ -696,7 +698,7 @@ class SpeechStream(stt.SpeechStream):
 
     def _emit(self, actions: Sequence[Action]) -> None:
         offset = self.start_time_offset
-        hint = self._settings.language
+        hint = self._connection_language
         language = LanguageCode("" if hint == ANY_LANGUAGE else hint)
         for action in actions:
             if isinstance(action, StartOfSpeech):

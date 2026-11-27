@@ -750,8 +750,8 @@ async def test_update_options_reconnects_only_for_setup_options() -> None:
     # the user's turn is not ended by the reconnect (live check: a reconnect mid-sentence
     # used to emit END_OF_SPEECH, a false cut-off caused by a settings change).
     srv = Server()
-    first = FakeWebSocket([srv.ready(), *srv.steps(SPEECH, 2), *srv.word("bonjour", 0.0, 0.3)])
-    second = FakeWebSocket([Server.ready()])
+    first = FakeWebSocket([srv.ready(), *srv.steps(SPEECH, 2), *srv.word("hello", 0.0, 0.3)])
+    second = FakeWebSocket([Server.ready(), *Server.word("bonjour", 0.0, 0.2)])
     provider, stream, session = make_stream(first, second)
     stream.push_frame(audio_frame())
     events = await collect(stream, until=is_type(SpeechEventType.INTERIM_TRANSCRIPT))
@@ -764,7 +764,11 @@ async def test_update_options_reconnects_only_for_setup_options() -> None:
     stream.end_input()
     events += await collect(stream)
 
-    assert texts(events, SpeechEventType.FINAL_TRANSCRIPT) == ["bonjour"]
+    finals = of_type(events, SpeechEventType.FINAL_TRANSCRIPT)
+    assert [(ev.alternatives[0].text, ev.alternatives[0].language) for ev in finals] == [
+        ("hello", "en"),
+        ("bonjour", "fr"),
+    ]
     assert [ev.type for ev in events].count(SpeechEventType.START_OF_SPEECH) == 1
     assert events[-1].type == SpeechEventType.END_OF_SPEECH
     assert len(first.sent_of("end_of_stream")) == 1
