@@ -852,24 +852,57 @@ async def test_api_host_selects_the_websocket_url(monkeypatch: pytest.MonkeyPatc
         STTExperimental(api_key="test-key", gradium_api="wss://api.gradium.ai/api/speech/asr")
 
 
-@pytest.mark.parametrize("model_matches", [True, False])
-async def test_thresholds_follow_the_scorer_that_loaded(model_matches: bool) -> None:
-    # The learned and fallback scores live on different scales. When the server runs
-    # another model than the weights were trained on, the stream falls back to
+@pytest.mark.parametrize(
+    ("model_matches", "delay_matches"), [(True, True), (False, True), (True, False)]
+)
+async def test_thresholds_follow_the_scorer_that_loaded(
+    model_matches: bool, delay_matches: bool
+) -> None:
+    # The learned and fallback scores live on different scales. When the server model
+    # or delay differs from the training configuration, the stream falls back to
     # min(p2, p3) and must also switch to the thresholds calibrated for it; otherwise the
     # preset's false cut-off budget no longer holds.
     from livekit.plugins.gradium.experimental.scorer import LearnedScorer, load_weights
 
-    model = load_weights("default").model if model_matches else "another-model"
+    weights = load_weights("default")
+    model = weights.model if model_matches else "another-model"
     srv = Server()
-    ws = FakeWebSocket([srv.ready(model), *srv.steps(SPEECH, 2), *srv.word("ok", 0.0, 0.2)])
+    ready = srv.ready(model)
+    ready["delay_in_frames"] = weights.delay_in_frames if delay_matches else 16
+    ws = FakeWebSocket([ready, *srv.steps(SPEECH, 2), *srv.word("ok", 0.0, 0.2)])
     _, stream, _ = make_stream(ws, pinned=False, eagerness="prudent")
     stream.push_frame(audio_frame())
     await collect(stream, until=is_type(SpeechEventType.INTERIM_TRANSCRIPT))
-    kind = "learned" if model_matches else "fallback"
-    assert isinstance(stream.machine.scorer, LearnedScorer) is model_matches
+    learned = model_matches and delay_matches
+    kind = "learned" if learned else "fallback"
+    assert isinstance(stream.machine.scorer, LearnedScorer) is learned
     assert stream.machine.profile == preset("prudent", scorer=kind)
     # a turn knob update keeps the thresholds of the scorer in use
     stream.update_options(eagerness="responsive")
     assert stream.machine.profile == preset("responsive", scorer=kind)
     await stream.aclose()
+
+
+async def test_scorer_is_reselected_when_server_delay_changes_on_reconnect() -> None:
+    # The scorer is chosen per connection, from what that connection's `ready` reports.
+    # A reconnect that lands on another delay must drop the learned scorer: its
+    # word-timing features would no longer mean what they meant in training.
+    from livekit.plugins.gradium.experimental.scorer import (
+        FallbackScorer,
+        LearnedScorer,
+        load_weights,
+    )
+
+    model = load_weights("default").model
+    first = FakeWebSocket([Server.ready(model), *Server.word("hello", 0.0, 0.2)])
+    ready = Server.ready(model)
+    ready["delay_in_frames"] = 16
+    second = FakeWebSocket([ready, *Server.word("bonjour", 0.0, 0.2)])
+    _, stream, _ = make_stream(first, second, pinned=False)
+
+    async with stream:
+        await collect(stream, until=is_type(SpeechEventType.INTERIM_TRANSCRIPT))
+        assert isinstance(stream.machine.scorer, LearnedScorer)
+        stream.update_options(language="fr")
+        await collect(stream, until=is_type(SpeechEventType.INTERIM_TRANSCRIPT))
+        assert isinstance(stream.machine.scorer, FallbackScorer)

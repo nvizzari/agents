@@ -277,7 +277,7 @@ class STTExperimental(stt.STT):
         """The turn knobs for the requested scorer.
 
         A stream switches to the fallback scorer's profile when the weights cannot be
-        used (missing file, or trained for another server model); see `SpeechStream`.
+        used (missing file, or a different server model or delay); see `SpeechStream`.
         """
         return self._settings.profile
 
@@ -393,8 +393,8 @@ class SpeechStream(stt.SpeechStream):
         fallback = FallbackScorer()
         self._machine = TurnMachine(settings.profile_for(fallback), fallback)
         self._request_id = ""
-        self._server_model: str | None = None
-        self._scorer_key: tuple[str | Path | None, str | None] = (None, None)
+        self._server_ready: signals.Ready | None = None
+        self._scorer_key: tuple[str | Path | None, str, int] | None = None
         self._scorer_task: asyncio.Task[None] | None = None
         # bumped by each update that needs a new connection
         self._generation = 0
@@ -433,10 +433,10 @@ class SpeechStream(stt.SpeechStream):
         )
         self._settings = new
         self._machine.profile = new.profile_for(self._machine.scorer)
-        if new.weights != old.weights and self._server_model is not None:
+        if new.weights != old.weights and self._server_ready is not None:
             if self._scorer_task is not None:
                 self._scorer_task.cancel()
-            self._scorer_task = asyncio.create_task(self._install_scorer(self._server_model))
+            self._scorer_task = asyncio.create_task(self._install_scorer(self._server_ready))
         if new.setup_key() != old.setup_key():
             self._generation += 1
             with contextlib.suppress(utils.aio.ChanClosed):
@@ -448,28 +448,30 @@ class SpeechStream(stt.SpeechStream):
             await utils.aio.cancel_and_wait(self._scorer_task)
         await super().aclose()
 
-    async def _install_scorer(self, model: str | None) -> None:
-        """Load the scorer for the current weights and `model`, unless already loaded.
+    async def _install_scorer(self, ready: signals.Ready) -> None:
+        """Load the scorer for the server's model and delay, unless already loaded.
 
         The machine's thresholds follow the scorer that actually loaded: when the
         weights are unusable, the fallback runs with the fallback's calibrated profile.
         """
         weights = self._settings.weights
-        key = (weights, model)
+        key = (weights, ready.model, ready.delay_in_frames)
         if key == self._scorer_key:
             return
         scorer: Scorer = (
             FallbackScorer()
             if weights is None
             # reads the weights file: keep it off the event loop
-            else await asyncio.to_thread(load_scorer, weights, model=model)
+            else await asyncio.to_thread(
+                load_scorer, weights, model=ready.model, delay_in_frames=ready.delay_in_frames
+            )
         )
-        if weights != self._settings.weights:
-            return  # superseded by a newer update while loading
+        if weights != self._settings.weights or ready is not self._server_ready:
+            return  # superseded by a settings update or reconnect while loading
         self._scorer_key = key
         self._machine.set_scorer(scorer)
         self._machine.profile = self._settings.profile_for(scorer)
-        logger.debug("Gradium scorer %s for model %s", scorer.name, model)
+        logger.debug("Gradium scorer %s for model %s", scorer.name, ready.model)
 
     # connection
 
@@ -491,6 +493,7 @@ class SpeechStream(stt.SpeechStream):
                 await self._run_connection(ws, conn)
                 ended = not conn.reconnect
             finally:
+                self._server_ready = None
                 # Whatever ended the connection, no received word stays buffered. Only the
                 # end of input ends the user's turn: after a reconnect or a failure the
                 # base class retries, and the turn continues on the next connection.
@@ -637,8 +640,8 @@ class SpeechStream(stt.SpeechStream):
                 continue
             if isinstance(sig, signals.Ready):
                 self._request_id = sig.request_id
-                self._server_model = sig.model
-                await self._install_scorer(sig.model)
+                self._server_ready = sig
+                await self._install_scorer(sig)
 
             if conn.closing and isinstance(sig, signals.Step):
                 # Draining can still return buffered steps. Keep collecting words,

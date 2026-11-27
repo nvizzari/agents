@@ -114,6 +114,7 @@ BAD_WEIGHTS: dict[str, Callable[[Path], tuple[str | Path, str | None]]] = {
     "unknown bundled name": lambda tmp: ("no-such-weights", None),
     "not json": lambda tmp: (_text_file(tmp, "{nope"), None),
     "wrong format version": lambda tmp: (_write(tmp, lambda d: d.update(format=999)), None),
+    "missing training delay": lambda tmp: (_write(tmp, lambda d: d.pop("delay_in_frames")), None),
     "missing weight set": lambda tmp: (_write(tmp, lambda d: d["sets"].pop("post_flush")), None),
     "unknown feature": lambda tmp: (
         _write(tmp, lambda d: d["sets"]["passive"]["features"].append("pitch")),

@@ -275,6 +275,9 @@ class Weights:
     name: str
     model: str
     """Server model version (`model_ext`) the probabilities were recorded with."""
+    delay_in_frames: int
+    """Model delay the training streams were recorded at. The word-timing features
+    depend on it, so the weights only apply to a server running the same delay."""
     passive: _Forest
     """Steps with no flush in effect."""
     post_flush: _Forest
@@ -290,9 +293,13 @@ class Weights:
         if version != FORMAT_VERSION:
             raise ValueError(f"unsupported weights format {version!r} (expected {FORMAT_VERSION})")
         sets = data["sets"]
+        delay = data["delay_in_frames"]
+        if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0:
+            raise ValueError(f"delay_in_frames must be a non-negative integer, got {delay!r}")
         return cls(
             name=str(data["name"]),
             model=str(data["model"]),
+            delay_in_frames=delay,
             passive=_Forest(sets["passive"]),
             post_flush=_Forest(sets["post_flush"]),
             meta={k: v for k, v in data.items() if k != "sets"},
@@ -359,8 +366,8 @@ def load_weights(weights: str | Path) -> Weights:
 
     Raises:
         OSError: The file cannot be read.
-        ValueError: The file is not valid JSON, has another format version, or holds a
-            malformed weight set.
+        ValueError: The file is not valid JSON, has another format version, lacks the
+            training delay, or holds a malformed weight set.
     """
     path = weights_path(weights).resolve()
     try:
@@ -369,7 +376,9 @@ def load_weights(weights: str | Path) -> Weights:
         raise ValueError(f"malformed weights file: {e!r}") from e
 
 
-def load_scorer(weights: str | Path | None, *, model: str | None = None) -> Scorer:
+def load_scorer(
+    weights: str | Path | None, *, model: str | None = None, delay_in_frames: int | None = None
+) -> Scorer:
     """Return the learned scorer for `weights`, or the fallback when it cannot be used.
 
     Args:
@@ -378,6 +387,8 @@ def load_scorer(weights: str | Path | None, *, model: str | None = None) -> Scor
         model: Server model version from the `ready` message. Weights trained for
             another version are rejected, since the probabilities they read may have
             shifted.
+        delay_in_frames: Model delay reported by the server. The weights must have
+            been trained at this delay for their word-timing features to match.
     """
     if weights is None:
         return FallbackScorer()
@@ -397,6 +408,15 @@ def load_scorer(weights: str | Path | None, *, model: str | None = None) -> Scor
             loaded.name,
             loaded.model,
             model,
+        )
+        return FallbackScorer()
+    if delay_in_frames is not None and loaded.delay_in_frames != delay_in_frames:
+        logger.warning(
+            "Gradium scorer weights %r were trained with delay_in_frames=%d but the server "
+            "reports %d, using the min(p2, p3) fallback",
+            loaded.name,
+            loaded.delay_in_frames,
+            delay_in_frames,
         )
         return FallbackScorer()
     return LearnedScorer(loaded)

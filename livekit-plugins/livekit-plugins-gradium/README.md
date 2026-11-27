@@ -294,7 +294,7 @@ whichever scorer runs. All times are seconds of audio.
 | `max_eager_per_turn` | Cap on preflights per turn (the framework starts at most 3 preemptive generations per turn). |
 | `start_threshold` | Score that opens a turn before any word arrives (faster barge-in, more false starts on noise). `None` waits for the first word. |
 | `warmup_steps` | Steps ignored at the start of each connection. |
-| `delay_in_frames` | Model delay in 80 ms steps: transcript latency against accuracy. Changing it reconnects, and the learned weights were trained at 10. |
+| `delay_in_frames` | Model delay in 80 ms steps: transcript latency against accuracy. Changing it reconnects. The stream uses the fallback scorer if the reported delay differs from that of the selected weights. The bundled weights were trained at 10. |
 | `weights` | Name or path of the scorer weights; `None` forces the fallback scorer. |
 
 `language` is sent to the server as given; `"any"` transcribes any language. The plugin

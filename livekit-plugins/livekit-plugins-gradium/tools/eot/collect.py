@@ -203,8 +203,12 @@ class MachinePolicy:
         if self.machine is None:
             if data.get("type") != "ready":
                 raise RuntimeError("first message is not `ready`")
-            # the scorer the plugin would install for this server model
-            scorer = load_scorer(self._profile.weights, model=str(data.get("model_ext") or ""))
+            # the scorer the plugin would install for this server model and delay
+            scorer = load_scorer(
+                self._profile.weights,
+                model=str(data.get("model_ext") or ""),
+                delay_in_frames=int(data["delay_in_frames"]),
+            )
             self.machine = TurnMachine(self._profile, scorer)
         actions = self.machine.on_signal(sig)
         return [a.flush_id for a in actions if isinstance(a, SendFlush)]
